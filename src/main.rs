@@ -73,9 +73,15 @@ enum Command {
         /// characters with hyphens when omitted.
         #[arg(long)]
         id: Option<String>,
+
+        /// Full ID of the parent task, e.g. `0005-implement-auth`.
+        /// Use when breaking a larger task into subtasks so that children
+        /// can later be queried with `task list --parent <id>`.
+        #[arg(long)]
+        parent: Option<String>,
     },
 
-    /// List tasks, optionally filtered by status.
+    /// List tasks, optionally filtered by status and/or parent.
     ///
     /// Outputs one task per line in the format:
     ///   `<id>  <status>  <title>  [locked]`
@@ -86,6 +92,11 @@ enum Command {
         /// Accepted values: `open`, `in_progress`, `done`, `cancelled`.
         #[arg(long, value_parser = parse_status)]
         status: Option<Status>,
+
+        /// Only show direct children of this parent task ID.
+        /// Use to check subtask progress without listing the entire backlog.
+        #[arg(long)]
+        parent: Option<String>,
 
         /// Emit a JSON array instead of the default plain-text table.
         /// Each element includes all task fields plus `locked_by` and
@@ -216,13 +227,18 @@ fn parse_status(s: &str) -> Result<Status, String> {
 /// Errors if neither is set, since anonymous task ownership is not permitted.
 fn resolve_holder(flag: Option<String>) -> anyhow::Result<String> {
     flag.or_else(|| std::env::var("TASK_HOLDER").ok())
-        .ok_or_else(|| anyhow::anyhow!(
-            "a holder name is required: pass --holder or set the TASK_HOLDER environment variable"
-        ))
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "a holder name is required: pass --holder or set the TASK_HOLDER environment variable"
+            )
+        })
 }
 
 fn print_task_human(task: &models::Task) {
     println!("id:          {}", task.id);
+    if let Some(p) = &task.parent_id {
+        println!("parent:      {p}");
+    }
     println!("title:       {}", task.title);
     if let Some(d) = &task.description {
         println!("description: {d}");
@@ -259,14 +275,25 @@ fn main() -> anyhow::Result<()> {
             title,
             description,
             id,
+            parent,
         } => {
             let slug = id.unwrap_or_else(|| db::slugify(&title));
-            let full_id = db::create_task(&conn, &slug, &title, description.as_deref())?;
+            let full_id = db::create_task(
+                &conn,
+                &slug,
+                &title,
+                description.as_deref(),
+                parent.as_deref(),
+            )?;
             println!("{full_id}");
         }
 
-        Command::List { status, json } => {
-            let tasks = db::list_tasks(&conn, status.as_ref())?;
+        Command::List {
+            status,
+            parent,
+            json,
+        } => {
+            let tasks = db::list_tasks(&conn, status.as_ref(), parent.as_deref())?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else {

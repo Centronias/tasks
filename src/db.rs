@@ -2,7 +2,7 @@ use std::str::FromStr;
 
 use crate::models::{Lock, Status, Task};
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{Connection, OptionalExtension, params};
 
 pub fn open_db() -> rusqlite::Result<Connection> {
     let conn = Connection::open("tasks.db")?;
@@ -19,7 +19,8 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             description TEXT,
             status      TEXT NOT NULL DEFAULT 'open',
             created_at  TEXT NOT NULL,
-            updated_at  TEXT NOT NULL
+            updated_at  TEXT NOT NULL,
+            parent_id   TEXT REFERENCES tasks(id)
         );
         CREATE TABLE IF NOT EXISTS locks (
             task_id     TEXT PRIMARY KEY REFERENCES tasks(id) ON DELETE CASCADE,
@@ -27,7 +28,17 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             acquired_at TEXT NOT NULL,
             expires_at  TEXT NOT NULL
         );",
-    )
+    )?;
+    // Add parent_id to databases created before this column existed.
+    let col_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'parent_id'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !col_exists {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN parent_id TEXT REFERENCES tasks(id)")?;
+    }
+    Ok(())
 }
 
 pub fn slugify(title: &str) -> String {
@@ -47,14 +58,15 @@ pub fn create_task(
     slug: &str,
     title: &str,
     description: Option<&str>,
+    parent_id: Option<&str>,
 ) -> rusqlite::Result<String> {
     let now = Utc::now().to_rfc3339();
     // Single statement: SELECT MAX(num)+1 and INSERT are atomic, eliminating TOCTOU.
     conn.execute(
-        "INSERT INTO tasks (id, num, title, description, status, created_at, updated_at)
-         SELECT printf('%04d-%s', n, ?1), n, ?2, ?3, 'open', ?4, ?4
+        "INSERT INTO tasks (id, num, title, description, status, created_at, updated_at, parent_id)
+         SELECT printf('%04d-%s', n, ?1), n, ?2, ?3, 'open', ?4, ?4, ?5
          FROM (SELECT COALESCE(MAX(num), 0) + 1 AS n FROM tasks)",
-        params![slug, title, description, now],
+        params![slug, title, description, now, parent_id],
     )?;
     conn.query_row(
         "SELECT id FROM tasks WHERE rowid = ?1",
@@ -65,16 +77,29 @@ pub fn create_task(
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
     let status_str: String = row.get(4)?;
-    let status = Status::from_str(&status_str)
-        .map_err(|e| rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into()))?;
-    let created_at: DateTime<Utc> = row
-        .get::<_, String>(5)?
-        .parse()
-        .map_err(|e: chrono::ParseError| rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(e)))?;
-    let updated_at: DateTime<Utc> = row
-        .get::<_, String>(6)?
-        .parse()
-        .map_err(|e: chrono::ParseError| rusqlite::Error::FromSqlConversionFailure(6, rusqlite::types::Type::Text, Box::new(e)))?;
+    let status = Status::from_str(&status_str).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(4, rusqlite::types::Type::Text, e.into())
+    })?;
+    let created_at: DateTime<Utc> =
+        row.get::<_, String>(5)?
+            .parse()
+            .map_err(|e: chrono::ParseError| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    5,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
+    let updated_at: DateTime<Utc> =
+        row.get::<_, String>(6)?
+            .parse()
+            .map_err(|e: chrono::ParseError| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    6,
+                    rusqlite::types::Type::Text,
+                    Box::new(e),
+                )
+            })?;
     let lock_expires: Option<DateTime<Utc>> = row
         .get::<_, Option<String>>(8)?
         .and_then(|s| s.parse().ok());
@@ -88,25 +113,29 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
         updated_at,
         locked_by: row.get(7)?,
         lock_expires,
+        parent_id: row.get(9)?,
     })
 }
 
 pub fn list_tasks(
     conn: &Connection,
     status_filter: Option<&Status>,
+    parent_filter: Option<&str>,
 ) -> rusqlite::Result<Vec<Task>> {
     let now = Utc::now().to_rfc3339();
     let sql = "SELECT t.id, t.num, t.title, t.description, t.status,
                       t.created_at, t.updated_at,
                       CASE WHEN l.expires_at > ?1 THEN l.holder END,
-                      CASE WHEN l.expires_at > ?1 THEN l.expires_at END
+                      CASE WHEN l.expires_at > ?1 THEN l.expires_at END,
+                      t.parent_id
                FROM tasks t
                LEFT JOIN locks l ON l.task_id = t.id
                WHERE (?2 IS NULL OR t.status = ?2)
+                 AND (?3 IS NULL OR t.parent_id = ?3)
                ORDER BY t.num ASC";
     let status_val = status_filter.map(ToString::to_string);
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![now, status_val], row_to_task)?;
+    let rows = stmt.query_map(params![now, status_val, parent_filter], row_to_task)?;
     rows.collect()
 }
 
@@ -115,7 +144,8 @@ pub fn get_task(conn: &Connection, id: &str) -> rusqlite::Result<Option<Task>> {
     let sql = "SELECT t.id, t.num, t.title, t.description, t.status,
                       t.created_at, t.updated_at,
                       CASE WHEN l.expires_at > ?1 THEN l.holder END,
-                      CASE WHEN l.expires_at > ?1 THEN l.expires_at END
+                      CASE WHEN l.expires_at > ?1 THEN l.expires_at END,
+                      t.parent_id
                FROM tasks t
                LEFT JOIN locks l ON l.task_id = t.id
                WHERE t.id = ?2";
@@ -165,12 +195,7 @@ pub fn delete_task(conn: &Connection, id: &str, force: bool) -> anyhow::Result<b
     Ok(rows > 0)
 }
 
-pub fn acquire_task(
-    conn: &Connection,
-    id: &str,
-    holder: &str,
-    ttl: u64,
-) -> anyhow::Result<()> {
+pub fn acquire_task(conn: &Connection, id: &str, holder: &str, ttl: u64) -> anyhow::Result<()> {
     let now = Utc::now();
     let now_str = now.to_rfc3339();
     let expires_str = (now + chrono::Duration::seconds(ttl.cast_signed())).to_rfc3339();
@@ -231,7 +256,12 @@ pub fn acquire_task(
     Ok(())
 }
 
-pub fn release_task(conn: &Connection, id: &str, holder: &str, force: bool) -> anyhow::Result<bool> {
+pub fn release_task(
+    conn: &Connection,
+    id: &str,
+    holder: &str,
+    force: bool,
+) -> anyhow::Result<bool> {
     let now = Utc::now().to_rfc3339();
     if !force {
         let existing_holder: Option<String> = conn
@@ -311,12 +341,12 @@ mod tests {
     // ── slugify ───────────────────────────────────────────────────────────────
 
     #[rstest]
-    #[case("Fix login bug",    "fix-login-bug")]
+    #[case("Fix login bug", "fix-login-bug")]
     #[case("  hello  world  ", "hello-world")]
     #[case("multiple---hyphens", "multiple-hyphens")]
-    #[case("already-a-slug",   "already-a-slug")]
-    #[case("123 task",         "123-task")]
-    #[case("!!!",              "")]
+    #[case("already-a-slug", "already-a-slug")]
+    #[case("123 task", "123-task")]
+    #[case("!!!", "")]
     fn test_slugify(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(slugify(input), expected);
     }
@@ -334,24 +364,41 @@ mod tests {
 
     #[rstest]
     fn create_assigns_sequential_ids(conn: Connection) {
-        let id1 = create_task(&conn, "task-a", "Task A", None).unwrap();
-        let id2 = create_task(&conn, "task-b", "Task B", None).unwrap();
+        let id1 = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        let id2 = create_task(&conn, "task-b", "Task B", None, None).unwrap();
         assert!(id1.starts_with("0001-"));
         assert!(id2.starts_with("0002-"));
     }
 
     #[rstest]
     fn create_starts_open(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.status, Status::Open);
     }
 
     #[rstest]
     fn create_stores_description(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", Some("some detail")).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", Some("some detail"), None).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.description.as_deref(), Some("some detail"));
+    }
+
+    #[rstest]
+    fn create_with_parent_links_child(conn: Connection) {
+        let parent = create_task(&conn, "parent", "Parent Task", None, None).unwrap();
+        let child = create_task(&conn, "child", "Child Task", None, Some(parent.as_str())).unwrap();
+        let task = get_task(&conn, &child).unwrap().unwrap();
+        assert_eq!(task.parent_id.as_deref(), Some(parent.as_str()));
+    }
+
+    #[rstest]
+    fn create_with_nonexistent_parent_errors(conn: Connection) {
+        let err = create_task(&conn, "orphan", "Orphan", None, Some("9999-ghost")).unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("foreign key")
+                || err.to_string().to_lowercase().contains("constraint")
+        );
     }
 
     // ── get_task ──────────────────────────────────────────────────────────────
@@ -363,27 +410,28 @@ mod tests {
 
     #[rstest]
     fn get_found_returns_correct_fields(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", Some("desc")).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", Some("desc"), None).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.id, id);
         assert_eq!(task.title, "My Task");
         assert_eq!(task.description.as_deref(), Some("desc"));
         assert_eq!(task.status, Status::Open);
+        assert!(task.parent_id.is_none());
     }
 
     // ── list_tasks ────────────────────────────────────────────────────────────
 
     #[rstest]
     fn list_empty(conn: Connection) {
-        assert!(list_tasks(&conn, None).unwrap().is_empty());
+        assert!(list_tasks(&conn, None, None).unwrap().is_empty());
     }
 
     #[rstest]
     fn list_returns_all_in_order(conn: Connection) {
-        create_task(&conn, "a", "A", None).unwrap();
-        create_task(&conn, "b", "B", None).unwrap();
-        create_task(&conn, "c", "C", None).unwrap();
-        let tasks = list_tasks(&conn, None).unwrap();
+        create_task(&conn, "a", "A", None, None).unwrap();
+        create_task(&conn, "b", "B", None, None).unwrap();
+        create_task(&conn, "c", "C", None, None).unwrap();
+        let tasks = list_tasks(&conn, None, None).unwrap();
         assert_eq!(tasks.len(), 3);
         assert!(tasks[0].num < tasks[1].num);
         assert!(tasks[1].num < tasks[2].num);
@@ -395,18 +443,32 @@ mod tests {
     #[case(Status::Done)]
     #[case(Status::Cancelled)]
     fn list_filters_by_status(conn: Connection, #[case] filter: Status) {
-        let _id1 = create_task(&conn, "task-a", "Task A", None).unwrap();
-        let id2 = create_task(&conn, "task-b", "Task B", None).unwrap();
-        let id3 = create_task(&conn, "task-c", "Task C", None).unwrap();
-        let id4 = create_task(&conn, "task-d", "Task D", None).unwrap();
+        let _id1 = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        let id2 = create_task(&conn, "task-b", "Task B", None, None).unwrap();
+        let id3 = create_task(&conn, "task-c", "Task C", None, None).unwrap();
+        let id4 = create_task(&conn, "task-d", "Task D", None, None).unwrap();
         // id1 starts as Open; set the rest explicitly
         update_task(&conn, &id2, None, None, Some(&Status::InProgress)).unwrap();
         update_task(&conn, &id3, None, None, Some(&Status::Done)).unwrap();
         update_task(&conn, &id4, None, None, Some(&Status::Cancelled)).unwrap();
 
-        let tasks = list_tasks(&conn, Some(&filter)).unwrap();
+        let tasks = list_tasks(&conn, Some(&filter), None).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, filter);
+    }
+
+    #[rstest]
+    fn list_filters_by_parent(conn: Connection) {
+        let parent = create_task(&conn, "parent", "Parent", None, None).unwrap();
+        let other = create_task(&conn, "other", "Other", None, None).unwrap();
+        let c1 = create_task(&conn, "child-1", "Child 1", None, Some(parent.as_str())).unwrap();
+        let c2 = create_task(&conn, "child-2", "Child 2", None, Some(parent.as_str())).unwrap();
+        create_task(&conn, "unrelated", "Unrelated", None, Some(other.as_str())).unwrap();
+
+        let children = list_tasks(&conn, None, Some(parent.as_str())).unwrap();
+        assert_eq!(children.len(), 2);
+        assert!(children.iter().any(|t| t.id == c1));
+        assert!(children.iter().any(|t| t.id == c2));
     }
 
     // ── update_task ───────────────────────────────────────────────────────────
@@ -418,7 +480,7 @@ mod tests {
 
     #[rstest]
     fn update_title_only(conn: Connection) {
-        let id = create_task(&conn, "my-task", "Old Title", Some("desc")).unwrap();
+        let id = create_task(&conn, "my-task", "Old Title", Some("desc"), None).unwrap();
         update_task(&conn, &id, Some("New Title"), None, None).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.title, "New Title");
@@ -428,7 +490,7 @@ mod tests {
 
     #[rstest]
     fn update_status_only(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         update_task(&conn, &id, None, None, Some(&Status::Done)).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.status, Status::Done);
@@ -444,14 +506,14 @@ mod tests {
 
     #[rstest]
     fn delete_open_task(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         delete_task(&conn, &id, false).unwrap();
         assert!(get_task(&conn, &id).unwrap().is_none());
     }
 
     #[rstest]
     fn delete_locked_without_force_errors(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "holder", 3600).unwrap();
         let err = delete_task(&conn, &id, false).unwrap_err();
         assert!(err.to_string().contains("--force"));
@@ -459,7 +521,7 @@ mod tests {
 
     #[rstest]
     fn delete_in_progress_without_force_errors(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         update_task(&conn, &id, None, None, Some(&Status::InProgress)).unwrap();
         let err = delete_task(&conn, &id, false).unwrap_err();
         assert!(err.to_string().contains("--force"));
@@ -467,7 +529,7 @@ mod tests {
 
     #[rstest]
     fn delete_locked_with_force(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "holder", 3600).unwrap();
         assert!(delete_task(&conn, &id, true).unwrap());
         assert!(get_task(&conn, &id).unwrap().is_none());
@@ -477,7 +539,7 @@ mod tests {
 
     #[rstest]
     fn acquire_sets_in_progress(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.status, Status::InProgress);
@@ -486,14 +548,14 @@ mod tests {
 
     #[rstest]
     fn acquire_same_holder_reacquires(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
     }
 
     #[rstest]
     fn acquire_different_holder_rejected(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         let err = acquire_task(&conn, &id, "agent2", 3600).unwrap_err();
         assert!(err.to_string().contains("agent1"));
@@ -501,7 +563,7 @@ mod tests {
 
     #[rstest]
     fn acquire_expired_lock_allows_new_holder(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         insert_expired_lock(&conn, &id, "old-holder");
         acquire_task(&conn, &id, "new-holder", 3600).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
@@ -526,7 +588,7 @@ mod tests {
 
     #[rstest]
     fn release_removes_lock(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         release_task(&conn, &id, "agent1", false).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
@@ -535,13 +597,13 @@ mod tests {
 
     #[rstest]
     fn release_no_lock_returns_false(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         assert!(!release_task(&conn, &id, "agent1", false).unwrap());
     }
 
     #[rstest]
     fn release_other_holder_rejected(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         let err = release_task(&conn, &id, "agent2", false).unwrap_err();
         assert!(err.to_string().contains("--force"));
@@ -549,7 +611,7 @@ mod tests {
 
     #[rstest]
     fn release_other_holder_with_force(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         release_task(&conn, &id, "agent2", true).unwrap();
         assert!(get_task(&conn, &id).unwrap().unwrap().locked_by.is_none());
@@ -559,7 +621,7 @@ mod tests {
 
     #[rstest]
     fn renew_extends_expiry(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "agent1", 1).unwrap();
         renew_task(&conn, &id, "agent1", 7200).unwrap();
         let raw: String = conn
@@ -575,14 +637,14 @@ mod tests {
 
     #[rstest]
     fn renew_no_lock_errors(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         let err = renew_task(&conn, &id, "agent1", 3600).unwrap_err();
         assert!(err.to_string().contains("no active lock"));
     }
 
     #[rstest]
     fn renew_wrong_holder_errors(conn: Connection) {
-        let id = create_task(&conn, "my-task", "My Task", None).unwrap();
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         let err = renew_task(&conn, &id, "agent2", 3600).unwrap_err();
         assert!(err.to_string().contains("agent1"));

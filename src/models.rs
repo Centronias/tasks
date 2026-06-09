@@ -49,6 +49,8 @@ pub struct Task {
     pub locked_by: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub lock_expires: Option<DateTime<Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
 }
 
 #[cfg(test)]
