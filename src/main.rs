@@ -421,17 +421,17 @@ fn resolve_holder(flag: Option<String>) -> anyhow::Result<String> {
 
 fn print_task_human(task: &models::Task) {
     println!("id:          {}", task.id);
+    println!("title:       {}", task.title);
+    println!("status:      {}", task.status);
     if let Some(p) = &task.parent_id {
         println!("parent:      {p}");
     }
-    println!("title:       {}", task.title);
     if let Some(d) = &task.description {
         println!("description: {d}");
     }
     if let Some(s) = &task.summary {
         println!("summary:     {s}");
     }
-    println!("status:      {}", task.status);
     println!(
         "created_at:  {}",
         task.created_at.format("%Y-%m-%dT%H:%M:%SZ")
