@@ -182,6 +182,8 @@ pub fn list_tasks(
     status_filter: Option<&Status>,
     parent_filter: Option<&str>,
     show_all: bool,
+    limit: Option<i64>,
+    offset: Option<i64>,
 ) -> rusqlite::Result<Vec<Task>> {
     let now = Utc::now().to_rfc3339();
     // When show_all is true  → no status restriction.
@@ -200,12 +202,22 @@ pub fn list_tasks(
                    OR (?2 IS NULL AND t.status IN ('open', 'in_progress'))
                )
                  AND (?3 IS NULL OR t.parent_id = ?3)
-               ORDER BY t.num ASC";
+               ORDER BY t.num ASC
+               LIMIT ?5 OFFSET ?6";
     let status_val = status_filter.map(ToString::to_string);
     let show_all_int: i32 = i32::from(show_all);
+    let limit_val = limit.unwrap_or(-1);
+    let offset_val = offset.unwrap_or(0);
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(
-        params![now, status_val, parent_filter, show_all_int],
+        params![
+            now,
+            status_val,
+            parent_filter,
+            show_all_int,
+            limit_val,
+            offset_val
+        ],
         row_to_task,
     )?;
     rows.collect()
@@ -216,6 +228,8 @@ pub fn search_tasks(
     query: &str,
     status_filter: Option<&Status>,
     parent_filter: Option<&str>,
+    limit: Option<i64>,
+    offset: Option<i64>,
 ) -> rusqlite::Result<Vec<Task>> {
     let now = Utc::now().to_rfc3339();
     let pattern = format!("%{query}%");
@@ -229,11 +243,21 @@ pub fn search_tasks(
                WHERE (t.title LIKE ?2 OR t.description LIKE ?2 OR t.summary LIKE ?2)
                  AND (?3 IS NULL OR t.status = ?3)
                  AND (?4 IS NULL OR t.parent_id = ?4)
-               ORDER BY t.num ASC";
+               ORDER BY t.num ASC
+               LIMIT ?5 OFFSET ?6";
     let status_val = status_filter.map(ToString::to_string);
+    let limit_val = limit.unwrap_or(-1);
+    let offset_val = offset.unwrap_or(0);
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map(
-        params![now, pattern, status_val, parent_filter],
+        params![
+            now,
+            pattern,
+            status_val,
+            parent_filter,
+            limit_val,
+            offset_val
+        ],
         row_to_task,
     )?;
     rows.collect()
@@ -775,7 +799,11 @@ mod tests {
 
     #[rstest]
     fn list_empty(conn: Connection) {
-        assert!(list_tasks(&conn, None, None, false).unwrap().is_empty());
+        assert!(
+            list_tasks(&conn, None, None, false, None, None)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[rstest]
@@ -783,7 +811,7 @@ mod tests {
         create_task(&conn, "a", "A", None, None).unwrap();
         create_task(&conn, "b", "B", None, None).unwrap();
         create_task(&conn, "c", "C", None, None).unwrap();
-        let tasks = list_tasks(&conn, None, None, false).unwrap();
+        let tasks = list_tasks(&conn, None, None, false, None, None).unwrap();
         assert_eq!(tasks.len(), 3);
         assert!(tasks[0].num < tasks[1].num);
         assert!(tasks[1].num < tasks[2].num);
@@ -804,7 +832,7 @@ mod tests {
         update_task(&conn, &id3, None, None, Some(&Status::Done), None).unwrap();
         update_task(&conn, &id4, None, None, Some(&Status::Cancelled), None).unwrap();
 
-        let tasks = list_tasks(&conn, Some(&filter), None, false).unwrap();
+        let tasks = list_tasks(&conn, Some(&filter), None, false, None, None).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, filter);
     }
@@ -817,7 +845,7 @@ mod tests {
         let c2 = create_task(&conn, "child-2", "Child 2", None, Some(parent.as_str())).unwrap();
         create_task(&conn, "unrelated", "Unrelated", None, Some(other.as_str())).unwrap();
 
-        let children = list_tasks(&conn, None, Some(parent.as_str()), false).unwrap();
+        let children = list_tasks(&conn, None, Some(parent.as_str()), false, None, None).unwrap();
         assert_eq!(children.len(), 2);
         assert!(children.iter().any(|t| t.id == c1));
         assert!(children.iter().any(|t| t.id == c2));
@@ -1067,7 +1095,7 @@ mod tests {
         create_task(&conn, "fix-login", "Fix Login Bug", None, None).unwrap();
         create_task(&conn, "add-feature", "Add Feature", None, None).unwrap();
 
-        let results = search_tasks(&conn, "Login", None, None).unwrap();
+        let results = search_tasks(&conn, "Login", None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Fix Login Bug");
     }
@@ -1084,7 +1112,7 @@ mod tests {
         .unwrap();
         create_task(&conn, "task-b", "Task B", Some("something else"), None).unwrap();
 
-        let results = search_tasks(&conn, "unique_keyword", None, None).unwrap();
+        let results = search_tasks(&conn, "unique_keyword", None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Task A");
     }
@@ -1093,7 +1121,7 @@ mod tests {
     fn search_no_match_returns_empty(conn: Connection) {
         create_task(&conn, "task-a", "Task A", Some("description A"), None).unwrap();
 
-        let results = search_tasks(&conn, "xyzzy_no_match", None, None).unwrap();
+        let results = search_tasks(&conn, "xyzzy_no_match", None, None, None, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1111,7 +1139,7 @@ mod tests {
         .unwrap();
         create_task(&conn, "task-b", "Task B", None, None).unwrap();
 
-        let results = search_tasks(&conn, "approach_xyz", None, None).unwrap();
+        let results = search_tasks(&conn, "approach_xyz", None, None, None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
     }
@@ -1122,11 +1150,13 @@ mod tests {
         let id2 = create_task(&conn, "task-b", "Alpha Done", None, None).unwrap();
         update_task(&conn, &id2, None, None, Some(&Status::Done), None).unwrap();
 
-        let open_results = search_tasks(&conn, "Alpha", Some(&Status::Open), None).unwrap();
+        let open_results =
+            search_tasks(&conn, "Alpha", Some(&Status::Open), None, None, None).unwrap();
         assert_eq!(open_results.len(), 1);
         assert_eq!(open_results[0].id, id1);
 
-        let done_results = search_tasks(&conn, "Alpha", Some(&Status::Done), None).unwrap();
+        let done_results =
+            search_tasks(&conn, "Alpha", Some(&Status::Done), None, None, None).unwrap();
         assert_eq!(done_results.len(), 1);
         assert_eq!(done_results[0].id, id2);
     }
@@ -1145,7 +1175,8 @@ mod tests {
         )
         .unwrap();
 
-        let results = search_tasks(&conn, "Alpha", None, Some(parent.as_str())).unwrap();
+        let results =
+            search_tasks(&conn, "Alpha", None, Some(parent.as_str()), None, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, c1);
     }

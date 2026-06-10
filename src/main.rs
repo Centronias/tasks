@@ -130,6 +130,14 @@ enum Command {
         /// Incompatible with --json.
         #[arg(long)]
         tree: bool,
+
+        /// Maximum number of tasks to return.
+        #[arg(long)]
+        limit: Option<i64>,
+
+        /// Number of tasks to skip before returning results.
+        #[arg(long)]
+        offset: Option<i64>,
     },
 
     /// Show full details for a single task.
@@ -293,6 +301,14 @@ enum Command {
         /// Emit a JSON array instead of the default plain-text table.
         #[arg(long)]
         json: bool,
+
+        /// Maximum number of tasks to return.
+        #[arg(long)]
+        limit: Option<i64>,
+
+        /// Number of tasks to skip before returning results.
+        #[arg(long)]
+        offset: Option<i64>,
     },
 
     /// Complete a task in one step: optionally set summary, release the lock, and mark done.
@@ -341,6 +357,37 @@ enum Command {
     /// Reap expired locks and reset stalled in-progress tasks to open.
     Gc {
         /// Preview what would be recovered without making changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Export tasks as a JSON array to stdout or a file.
+    ///
+    /// By default exports only `open` and `in_progress` tasks.
+    /// Pass `--all` to include every status.
+    /// Pass `--output <file>` to write to a file instead of stdout.
+    Export {
+        /// Export all tasks regardless of status.
+        #[arg(long)]
+        all: bool,
+
+        /// Write the JSON output to this file instead of stdout.
+        #[arg(long)]
+        output: Option<String>,
+    },
+
+    /// Import tasks from a JSON file (as produced by `tasks export`).
+    ///
+    /// Reads a JSON array of task objects and creates each as a new task,
+    /// assigning fresh IDs. Original IDs are not preserved to avoid collisions.
+    ///
+    /// Pass `--dry-run` to preview what would be created without writing.
+    Import {
+        /// Path to the JSON file to import.
+        #[arg(long)]
+        file: String,
+
+        /// Preview what would be imported without writing anything.
         #[arg(long)]
         dry_run: bool,
     },
@@ -500,16 +547,25 @@ fn main() -> anyhow::Result<()> {
             all,
             json,
             tree,
+            limit,
+            offset,
         } => {
             if tree && json {
                 anyhow::bail!("--tree and --json cannot be used together");
             }
             if tree {
                 // Fetch all tasks (ignoring parent filter for tree — we show the whole tree)
-                let tasks = db::list_tasks(&conn, status.as_ref(), None, true)?;
+                let tasks = db::list_tasks(&conn, status.as_ref(), None, true, None, None)?;
                 print_tree(&tasks, parent.as_deref());
             } else {
-                let tasks = db::list_tasks(&conn, status.as_ref(), parent.as_deref(), all)?;
+                let tasks = db::list_tasks(
+                    &conn,
+                    status.as_ref(),
+                    parent.as_deref(),
+                    all,
+                    limit,
+                    offset,
+                )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&tasks)?);
                 } else {
@@ -641,8 +697,17 @@ fn main() -> anyhow::Result<()> {
             status,
             parent,
             json,
+            limit,
+            offset,
         } => {
-            let tasks = db::search_tasks(&conn, &query, status.as_ref(), parent.as_deref())?;
+            let tasks = db::search_tasks(
+                &conn,
+                &query,
+                status.as_ref(),
+                parent.as_deref(),
+                limit,
+                offset,
+            )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else {
@@ -725,6 +790,49 @@ fn main() -> anyhow::Result<()> {
                 } else {
                     println!("recovered {} stalled tasks: {id_list}", ids.len());
                 }
+            }
+        }
+
+        Command::Export { all, output } => {
+            let tasks = db::list_tasks(&conn, None, None, all, None, None)?;
+            let json = serde_json::to_string_pretty(&tasks)?;
+            match output {
+                Some(path) => std::fs::write(&path, &json)
+                    .map_err(|e| anyhow::anyhow!("failed to write {path}: {e}"))?,
+                None => println!("{json}"),
+            }
+        }
+
+        Command::Import { file, dry_run } => {
+            let content = std::fs::read_to_string(&file)
+                .map_err(|e| anyhow::anyhow!("failed to read {file}: {e}"))?;
+            let tasks: Vec<models::Task> = serde_json::from_str(&content)
+                .map_err(|e| anyhow::anyhow!("invalid JSON in {file}: {e}"))?;
+            let count = tasks.len();
+            if dry_run {
+                for task in &tasks {
+                    println!(
+                        "would import: {} ({})",
+                        task.title,
+                        task.description.as_deref().unwrap_or("no description")
+                    );
+                }
+                println!("would import {count} tasks");
+            } else {
+                for task in &tasks {
+                    let slug = db::slugify(&task.title);
+                    let new_id = db::create_task(
+                        &conn,
+                        &slug,
+                        &task.title,
+                        task.description.as_deref(),
+                        task.parent_id.as_deref(),
+                    )?;
+                    if let Some(s) = &task.summary {
+                        db::update_task(&conn, &new_id, None, None, None, Some(s.as_str()))?;
+                    }
+                }
+                println!("imported {count} tasks");
             }
         }
 
