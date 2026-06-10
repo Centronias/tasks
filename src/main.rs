@@ -26,9 +26,8 @@
 mod db;
 mod models;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use models::Status;
-use std::str::FromStr;
 
 /// CLI for managing tasks handed off to LLM agents.
 ///
@@ -41,6 +40,11 @@ use std::str::FromStr;
 #[derive(Parser)]
 #[command(name = "task", about = "Manage tasks for LLM agents", version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
+    /// Path to the tasks database file.
+    /// Overrides the `TASKS_DB` environment variable and the ./tasks.db default.
+    #[arg(long, global = true)]
+    db: Option<String>,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -103,7 +107,7 @@ enum Command {
     List {
         /// Only show tasks with this status.
         /// Accepted values: `open`, `in_progress`, `done`, `cancelled`.
-        #[arg(long, value_parser = parse_status)]
+        #[arg(long)]
         status: Option<Status>,
 
         /// Only show direct children of this parent task ID.
@@ -121,6 +125,11 @@ enum Command {
         /// `lock_expires` when a live lock is present.
         #[arg(long)]
         json: bool,
+
+        /// Render tasks as an indented tree showing parent-child relationships.
+        /// Incompatible with --json.
+        #[arg(long)]
+        tree: bool,
     },
 
     /// Show full details for a single task.
@@ -154,7 +163,7 @@ enum Command {
 
         /// Set the task status.
         /// Accepted values: `open`, `in_progress`, `done`, `cancelled`.
-        #[arg(long, value_parser = parse_status)]
+        #[arg(long)]
         status: Option<Status>,
 
         /// Worker's closing summary: decisions made, approach taken, caveats.
@@ -251,10 +260,55 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-}
 
-fn parse_status(s: &str) -> Result<Status, String> {
-    Status::from_str(s)
+    /// Show the event history for a task.
+    ///
+    /// Prints each recorded event in chronological order: timestamp, event type, and actor (if any).
+    Log {
+        /// Full task ID, e.g. `0001-fix-login-bug`.
+        id: String,
+
+        /// Emit JSON instead of the default human-readable format.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Search tasks by text query across title, description, and summary.
+    ///
+    /// Returns tasks where title, description, or summary contains the query string
+    /// (case-insensitive LIKE match). Supports the same --status, --parent, and --json
+    /// flags as `list`.
+    Search {
+        /// Text to search for (matched against title, description, and summary).
+        query: String,
+
+        /// Only show tasks with this status.
+        #[arg(long)]
+        status: Option<Status>,
+
+        /// Only show direct children of this parent task ID.
+        #[arg(long)]
+        parent: Option<String>,
+
+        /// Emit a JSON array instead of the default plain-text table.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Generate a shell completion script and print it to stdout.
+    ///
+    /// Source the output in your shell profile to enable tab-completion for all
+    /// subcommands, flags, and `--status` values.
+    ///
+    /// PowerShell (one-time setup):
+    ///   tasks completions powershell | Out-File -Append $PROFILE
+    ///
+    /// Bash:
+    ///   tasks completions bash >> ~/.bashrc
+    Completions {
+        /// The shell to generate completions for (bash, zsh, fish, powershell, elvish).
+        shell: clap_complete::Shell,
+    },
 }
 
 /// Resolves the holder name from the CLI flag or the `TASK_HOLDER` env var.
@@ -298,9 +352,64 @@ fn print_task_human(task: &models::Task) {
     }
 }
 
+fn print_tree(tasks: &[models::Task], root_parent: Option<&str>) {
+    use std::collections::HashMap;
+
+    // Build parent → children index
+    let mut children: HashMap<Option<&str>, Vec<&models::Task>> = HashMap::new();
+    for task in tasks {
+        children
+            .entry(task.parent_id.as_deref())
+            .or_default()
+            .push(task);
+    }
+
+    fn print_node(
+        task: &models::Task,
+        children: &HashMap<Option<&str>, Vec<&models::Task>>,
+        prefix: &str,
+        is_last: bool,
+    ) {
+        let connector = if is_last { "└─ " } else { "├─ " };
+        let lock = if task.locked_by.is_some() {
+            " 🔒"
+        } else {
+            ""
+        };
+        println!(
+            "{prefix}{connector}[{}] {} {}{lock}",
+            task.status, task.id, task.title
+        );
+
+        let child_prefix = format!("{}{}", prefix, if is_last { "   " } else { "│  " });
+        if let Some(kids) = children.get(&Some(task.id.as_str())) {
+            for (i, kid) in kids.iter().enumerate() {
+                print_node(kid, children, &child_prefix, i == kids.len() - 1);
+            }
+        }
+    }
+
+    // Get top-level tasks (those whose parent matches root_parent)
+    let roots = children.get(&root_parent).cloned().unwrap_or_default();
+    for (i, root) in roots.iter().enumerate() {
+        print_node(root, &children, "", i == roots.len() - 1);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-    let conn = db::open_db()?;
+
+    // Handle completions before opening the database — no DB required.
+    if let Command::Completions { shell } = cli.command {
+        clap_complete::generate(shell, &mut Cli::command(), "tasks", &mut std::io::stdout());
+        return Ok(());
+    }
+
+    let db_path = cli
+        .db
+        .or_else(|| std::env::var("TASKS_DB").ok())
+        .unwrap_or_else(|| "tasks.db".to_string());
+    let conn = db::open_db(&db_path)?;
 
     match cli.command {
         Command::Migrate => {
@@ -340,32 +449,42 @@ fn main() -> anyhow::Result<()> {
             parent,
             all,
             json,
+            tree,
         } => {
-            let tasks = db::list_tasks(&conn, status.as_ref(), parent.as_deref(), all)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            if tree && json {
+                anyhow::bail!("--tree and --json cannot be used together");
+            }
+            if tree {
+                // Fetch all tasks (ignoring parent filter for tree — we show the whole tree)
+                let tasks = db::list_tasks(&conn, status.as_ref(), None, true)?;
+                print_tree(&tasks, parent.as_deref());
             } else {
-                use comfy_table::presets::UTF8_FULL_CONDENSED;
-                use comfy_table::{Cell, ContentArrangement, Table};
-                let mut table = Table::new();
-                table
-                    .load_preset(UTF8_FULL_CONDENSED)
-                    .set_content_arrangement(ContentArrangement::Dynamic)
-                    .set_header(vec!["ID", "STATUS", "TITLE", "LOCKED"]);
-                for task in &tasks {
-                    let lock_marker = if task.locked_by.is_some() {
-                        "\u{1f512}"
-                    } else {
-                        ""
-                    };
-                    table.add_row(vec![
-                        Cell::new(&task.id),
-                        Cell::new(&task.status),
-                        Cell::new(&task.title),
-                        Cell::new(lock_marker),
-                    ]);
+                let tasks = db::list_tasks(&conn, status.as_ref(), parent.as_deref(), all)?;
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&tasks)?);
+                } else {
+                    use comfy_table::presets::UTF8_FULL_CONDENSED;
+                    use comfy_table::{Cell, ContentArrangement, Table};
+                    let mut table = Table::new();
+                    table
+                        .load_preset(UTF8_FULL_CONDENSED)
+                        .set_content_arrangement(ContentArrangement::Dynamic)
+                        .set_header(vec!["ID", "STATUS", "TITLE", "LOCKED"]);
+                    for task in &tasks {
+                        let lock_marker = if task.locked_by.is_some() {
+                            "\u{1f512}"
+                        } else {
+                            ""
+                        };
+                        table.add_row(vec![
+                            Cell::new(&task.id),
+                            Cell::new(&task.status),
+                            Cell::new(&task.title),
+                            Cell::new(lock_marker),
+                        ]);
+                    }
+                    println!("{table}");
                 }
-                println!("{table}");
             }
         }
 
@@ -446,6 +565,63 @@ fn main() -> anyhow::Result<()> {
             db::renew_task(&conn, &id, &holder, ttl)?;
             println!("renewed {id} for {ttl}s");
         }
+
+        Command::Log { id, json } => {
+            let id = db::resolve_id(&conn, &id)?;
+            let events = db::get_events(&conn, &id)?;
+            if json {
+                // serialize as array of {at, event, actor} objects
+                let v: Vec<_> = events.iter().map(|(event, actor, at)| {
+                    serde_json::json!({"at": at, "event": event, "actor": actor})
+                }).collect();
+                println!("{}", serde_json::to_string_pretty(&v)?);
+            } else {
+                for (event, actor, at) in &events {
+                    if let Some(a) = actor {
+                        println!("{at}  {event}  ({a})");
+                    } else {
+                        println!("{at}  {event}");
+                    }
+                }
+            }
+        }
+
+        Command::Search {
+            query,
+            status,
+            parent,
+            json,
+        } => {
+            let tasks = db::search_tasks(&conn, &query, status.as_ref(), parent.as_deref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&tasks)?);
+            } else {
+                use comfy_table::presets::UTF8_FULL_CONDENSED;
+                use comfy_table::{Cell, ContentArrangement, Table};
+                let mut table = Table::new();
+                table
+                    .load_preset(UTF8_FULL_CONDENSED)
+                    .set_content_arrangement(ContentArrangement::Dynamic)
+                    .set_header(vec!["ID", "STATUS", "TITLE", "LOCKED"]);
+                for task in &tasks {
+                    let lock_marker = if task.locked_by.is_some() {
+                        "\u{1f512}"
+                    } else {
+                        ""
+                    };
+                    table.add_row(vec![
+                        Cell::new(&task.id),
+                        Cell::new(&task.status),
+                        Cell::new(&task.title),
+                        Cell::new(lock_marker),
+                    ]);
+                }
+                println!("{table}");
+            }
+        }
+
+        // Handled before db::open_db() above; unreachable here.
+        Command::Completions { .. } => unreachable!(),
 
         Command::Stats { json } => {
             let s = db::stats(&conn)?;

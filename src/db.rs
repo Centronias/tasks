@@ -4,8 +4,8 @@ use crate::models::{Lock, Status, Task, TaskStats};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
-pub fn open_db() -> rusqlite::Result<Connection> {
-    let conn = Connection::open("tasks.db")?;
+pub fn open_db(path: &str) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
     conn.execute_batch("PRAGMA foreign_keys = ON")?;
     Ok(conn)
 }
@@ -27,6 +27,13 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
             holder      TEXT NOT NULL,
             acquired_at TEXT NOT NULL,
             expires_at  TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS events (
+            id       INTEGER PRIMARY KEY,
+            task_id  TEXT    NOT NULL,
+            event    TEXT    NOT NULL,
+            actor    TEXT,
+            at       TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         );",
     )?;
     // Add parent_id to databases created before this column existed.
@@ -48,6 +55,29 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN summary TEXT")?;
     }
     Ok(())
+}
+
+pub fn log_event(
+    conn: &Connection,
+    task_id: &str,
+    event: &str,
+    actor: Option<&str>,
+) -> rusqlite::Result<()> {
+    conn.execute(
+        "INSERT INTO events (task_id, event, actor) VALUES (?1, ?2, ?3)",
+        rusqlite::params![task_id, event, actor],
+    )?;
+    Ok(())
+}
+
+pub fn get_events(
+    conn: &Connection,
+    task_id: &str,
+) -> rusqlite::Result<Vec<(String, Option<String>, String)>> {
+    let mut stmt =
+        conn.prepare("SELECT event, actor, at FROM events WHERE task_id = ?1 ORDER BY id ASC")?;
+    let rows = stmt.query_map([task_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    rows.collect()
 }
 
 pub fn slugify(title: &str) -> String {
@@ -72,12 +102,11 @@ pub fn slugify(title: &str) -> String {
         slug[..40].to_string()
     } else {
         // Cut lands mid-word — back up to the last hyphen.
-        match slug[..40].rfind('-') {
-            Some(pos) => slug[..pos].to_string(),
-            // Single word longer than 40 chars: hard-truncate with no hyphen to
-            // back up to.
-            None => slug[..40].to_string(),
-        }
+        // Single word longer than 40 chars: hard-truncate with no hyphen to
+        // back up to.
+        slug[..40]
+            .rfind('-')
+            .map_or_else(|| slug[..40].to_string(), |pos| slug[..pos].to_string())
     }
 }
 
@@ -96,11 +125,13 @@ pub fn create_task(
          FROM (SELECT COALESCE(MAX(num), 0) + 1 AS n FROM tasks)",
         params![slug, title, description, now, parent_id],
     )?;
-    conn.query_row(
+    let full_id: String = conn.query_row(
         "SELECT id FROM tasks WHERE rowid = ?1",
         [conn.last_insert_rowid()],
         |r| r.get(0),
-    )
+    )?;
+    log_event(conn, &full_id, "created", None)?;
+    Ok(full_id)
 }
 
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
@@ -180,6 +211,34 @@ pub fn list_tasks(
     rows.collect()
 }
 
+pub fn search_tasks(
+    conn: &Connection,
+    query: &str,
+    status_filter: Option<&Status>,
+    parent_filter: Option<&str>,
+) -> rusqlite::Result<Vec<Task>> {
+    let now = Utc::now().to_rfc3339();
+    let pattern = format!("%{query}%");
+    let sql = "SELECT t.id, t.num, t.title, t.description, t.status,
+                      t.created_at, t.updated_at,
+                      CASE WHEN l.expires_at > ?1 THEN l.holder END,
+                      CASE WHEN l.expires_at > ?1 THEN l.expires_at END,
+                      t.parent_id, t.summary
+               FROM tasks t
+               LEFT JOIN locks l ON l.task_id = t.id
+               WHERE (t.title LIKE ?2 OR t.description LIKE ?2 OR t.summary LIKE ?2)
+                 AND (?3 IS NULL OR t.status = ?3)
+                 AND (?4 IS NULL OR t.parent_id = ?4)
+               ORDER BY t.num ASC";
+    let status_val = status_filter.map(ToString::to_string);
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map(
+        params![now, pattern, status_val, parent_filter],
+        row_to_task,
+    )?;
+    rows.collect()
+}
+
 pub fn get_task(conn: &Connection, id: &str) -> rusqlite::Result<Option<Task>> {
     let now = Utc::now().to_rfc3339();
     let sql = "SELECT t.id, t.num, t.title, t.description, t.status,
@@ -220,6 +279,11 @@ pub fn update_task(
             id
         ],
     )?;
+    if rows > 0
+        && let Some(new_status) = status
+    {
+        log_event(conn, id, &format!("status:{new_status}"), None)?;
+    }
     Ok(rows > 0)
 }
 
@@ -242,6 +306,9 @@ pub fn delete_task(conn: &Connection, id: &str, force: bool) -> anyhow::Result<b
         }
     }
     let rows = conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
+    if rows > 0 {
+        log_event(conn, id, "deleted", None)?;
+    }
     Ok(rows > 0)
 }
 
@@ -336,6 +403,7 @@ pub fn acquire_task(conn: &Connection, id: &str, holder: &str, ttl: u64) -> anyh
         "UPDATE tasks SET status = 'in_progress', updated_at = ?1 WHERE id = ?2",
         params![now_str, id],
     )?;
+    log_event(conn, id, "acquired", Some(holder))?;
     Ok(())
 }
 
@@ -361,6 +429,10 @@ pub fn release_task(
         }
     }
     let rows = conn.execute("DELETE FROM locks WHERE task_id = ?1", [id])?;
+    if rows > 0 {
+        let actor = if force { "force" } else { holder };
+        log_event(conn, id, "released", Some(actor))?;
+    }
     Ok(rows > 0)
 }
 
@@ -390,6 +462,7 @@ pub fn renew_task(conn: &Connection, id: &str, holder: &str, ttl: u64) -> anyhow
         }
     }
 
+    log_event(conn, id, "renewed", Some(holder))?;
     Ok(())
 }
 
@@ -474,7 +547,7 @@ pub fn stats(conn: &Connection) -> anyhow::Result<TaskStats> {
 mod tests {
     use super::{
         acquire_task, create_task, delete_task, get_task, list_tasks, migrate, release_task,
-        renew_task, resolve_id, slugify, update_task,
+        renew_task, resolve_id, search_tasks, slugify, update_task,
     };
     use crate::models::Status;
     use chrono::Utc;
@@ -886,5 +959,95 @@ mod tests {
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         let err = renew_task(&conn, &id, "agent2", 3600).unwrap_err();
         assert!(err.to_string().contains("agent1"));
+    }
+
+    // ── search_tasks ──────────────────────────────────────────────────────────
+
+    #[rstest]
+    fn search_finds_by_title(conn: Connection) {
+        create_task(&conn, "fix-login", "Fix Login Bug", None, None).unwrap();
+        create_task(&conn, "add-feature", "Add Feature", None, None).unwrap();
+
+        let results = search_tasks(&conn, "Login", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Fix Login Bug");
+    }
+
+    #[rstest]
+    fn search_finds_by_description(conn: Connection) {
+        create_task(
+            &conn,
+            "task-a",
+            "Task A",
+            Some("contains unique_keyword here"),
+            None,
+        )
+        .unwrap();
+        create_task(&conn, "task-b", "Task B", Some("something else"), None).unwrap();
+
+        let results = search_tasks(&conn, "unique_keyword", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Task A");
+    }
+
+    #[rstest]
+    fn search_no_match_returns_empty(conn: Connection) {
+        create_task(&conn, "task-a", "Task A", Some("description A"), None).unwrap();
+
+        let results = search_tasks(&conn, "xyzzy_no_match", None, None).unwrap();
+        assert!(results.is_empty());
+    }
+
+    #[rstest]
+    fn search_finds_by_summary(conn: Connection) {
+        let id = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        update_task(
+            &conn,
+            &id,
+            None,
+            None,
+            None,
+            Some("implemented via approach_xyz"),
+        )
+        .unwrap();
+        create_task(&conn, "task-b", "Task B", None, None).unwrap();
+
+        let results = search_tasks(&conn, "approach_xyz", None, None).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, id);
+    }
+
+    #[rstest]
+    fn search_respects_status_filter(conn: Connection) {
+        let id1 = create_task(&conn, "task-a", "Alpha Task", None, None).unwrap();
+        let id2 = create_task(&conn, "task-b", "Alpha Done", None, None).unwrap();
+        update_task(&conn, &id2, None, None, Some(&Status::Done), None).unwrap();
+
+        let open_results = search_tasks(&conn, "Alpha", Some(&Status::Open), None).unwrap();
+        assert_eq!(open_results.len(), 1);
+        assert_eq!(open_results[0].id, id1);
+
+        let done_results = search_tasks(&conn, "Alpha", Some(&Status::Done), None).unwrap();
+        assert_eq!(done_results.len(), 1);
+        assert_eq!(done_results[0].id, id2);
+    }
+
+    #[rstest]
+    fn search_respects_parent_filter(conn: Connection) {
+        let parent = create_task(&conn, "parent", "Parent Task", None, None).unwrap();
+        let other = create_task(&conn, "other", "Other Task", None, None).unwrap();
+        let c1 = create_task(&conn, "child-1", "Alpha Child", None, Some(parent.as_str())).unwrap();
+        create_task(
+            &conn,
+            "child-2",
+            "Alpha Unrelated Child",
+            None,
+            Some(other.as_str()),
+        )
+        .unwrap();
+
+        let results = search_tasks(&conn, "Alpha", None, Some(parent.as_str())).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].id, c1);
     }
 }
