@@ -69,6 +69,8 @@ tasks list --all --json
 | `--all` | Include every status (overrides `--status`) |
 | `--tree` | Display tasks as an indented hierarchy grouped by parent |
 | `--json` | Machine-readable JSON array with full fields and live lock info |
+| `--limit <N>` | Return at most N results (useful for large backlogs) |
+| `--offset <N>` | Skip the first N results (use with `--limit` to paginate) |
 
 ---
 
@@ -88,6 +90,8 @@ tasks search "jwt" --json
 | `--status` | Limit results to one status: `open`, `in_progress`, `done`, `cancelled` |
 | `--parent <id>` | Limit results to children of this parent task |
 | `--json` | Output results as a JSON array |
+| `--limit <N>` | Return at most N results (useful for large backlogs) |
+| `--offset <N>` | Skip the first N results (use with `--limit` to paginate) |
 
 ---
 
@@ -245,6 +249,38 @@ Show health metrics: status breakdown, completion rate, stalled tasks, expired l
 tasks stats
 tasks stats --json
 ```
+
+---
+
+### `export`
+
+Dump tasks as JSON to stdout or a file. By default includes only `open` and `in_progress` tasks; use `--all` to include `done` and `cancelled` tasks as well.
+
+```
+tasks export
+tasks export --all
+tasks export --all --output backup.json
+```
+
+| Flag | Description |
+|---|---|
+| `--all` | Include `done` and `cancelled` tasks in addition to open/in-progress |
+| `--output <file>` | Write JSON to this file instead of stdout |
+
+---
+
+### `import`
+
+Load tasks from a JSON file previously created by `export`. Reads from stdin if no file is given.
+
+```
+tasks import backup.json
+tasks import < backup.json
+```
+
+| Argument | Description |
+|---|---|
+| `<file>` | Path to the JSON file to import (omit to read from stdin) |
 
 ---
 

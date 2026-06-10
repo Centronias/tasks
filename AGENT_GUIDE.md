@@ -71,6 +71,12 @@ tasks update  0005-migrate-schema --status done
 tasks list --status in_progress --json
 ```
 
+For large backlogs, `--limit` and `--offset` are available on both `tasks list` and `tasks search` to page through results. For example:
+
+```
+tasks list --status open --limit 20 --offset 0
+```
+
 The JSON output includes `locked_by` and `lock_expires` per task. Use `tasks show <id>` for full detail on a specific task.
 
 ### Recovering a stalled worker
