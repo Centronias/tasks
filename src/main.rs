@@ -295,6 +295,31 @@ enum Command {
         json: bool,
     },
 
+    /// Complete a task in one step: optionally set summary, release the lock, and mark done.
+    ///
+    /// Convenience wrapper for the three commands workers typically run at the end of
+    /// a task:
+    ///   tasks update <id> --summary "..."
+    ///   tasks release <id>
+    ///   tasks update <id> --status done
+    ///
+    /// Example:
+    ///   tasks close 0004-fix-auth-bug --summary "Fixed by patching the JWT middleware."
+    Close {
+        /// Full task ID, e.g. `0001-fix-login-bug`.
+        id: String,
+
+        /// Optional closing summary: decisions made, approach taken, caveats.
+        #[arg(long)]
+        summary: Option<String>,
+
+        /// Name of the holder releasing the lock.
+        /// Falls back to the `TASK_HOLDER` environment variable when omitted.
+        /// One of `--holder` or `TASK_HOLDER` must be provided.
+        #[arg(long)]
+        holder: Option<String>,
+    },
+
     /// Generate a shell completion script and print it to stdout.
     ///
     /// Source the output in your shell profile to enable tab-completion for all
@@ -618,6 +643,30 @@ fn main() -> anyhow::Result<()> {
                 }
                 println!("{table}");
             }
+        }
+
+        Command::Close {
+            id,
+            summary,
+            holder,
+        } => {
+            let id = db::resolve_id(&conn, &id)?;
+            let holder = resolve_holder(holder)?;
+            // Optionally set summary first.
+            if let Some(s) = summary {
+                let found = db::update_task(&conn, &id, None, None, None, Some(s.as_str()))?;
+                if !found {
+                    anyhow::bail!("task not found: {id}");
+                }
+            }
+            // Release the lock (fails if held by a different holder).
+            db::release_task(&conn, &id, &holder, false)?;
+            // Mark done.
+            let found = db::update_task(&conn, &id, None, None, Some(&Status::Done), None)?;
+            if !found {
+                anyhow::bail!("task not found: {id}");
+            }
+            println!("closed {id}");
         }
 
         // Handled before db::open_db() above; unreachable here.

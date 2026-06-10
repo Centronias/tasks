@@ -16,13 +16,7 @@ tasks --help
 
 If not found, ask a human to install it. Do not use a local dev copy (`./target/release/tasks`, `cargo run`, etc.) — it may be stale or write to a different database.
 
-### Setup
-
-Run once before anything else (safe to re-run):
-
-```
-tasks migrate
-```
+Run `tasks migrate` once before anything else to initialize the database (safe to re-run). See README for installation details.
 
 ### Creating and delegating tasks
 
@@ -106,7 +100,7 @@ A worker receives a task ID from an orchestrator, acquires it, does the work, an
 
 ### Prerequisites
 
-Same as above — `tasks` must be a global CLI on `PATH`. Do not use a local dev copy.
+`tasks` must be a global CLI on `PATH`. Do not use a local dev copy. Run `tasks migrate` if the database has not been initialized yet.
 
 ### Identity
 
@@ -117,12 +111,6 @@ export TASK_HOLDER="worker-1"   # or any stable unique name
 ```
 
 All lock operations (`acquire`, `release`, `renew`) use this identity. If two agents share the same identity they share lock ownership — intentional only when the same logical worker restarts.
-
-### Setup
-
-```
-tasks migrate
-```
 
 ### Picking up a task
 
@@ -216,19 +204,4 @@ The distinction: if the parent task cannot be marked `done` without this work, i
 
 ---
 
-## Reference
-
-### Status values
-
-| Status | Meaning |
-|---|---|
-| `open` | Available to be picked up |
-| `in_progress` | Acquired by an agent (lock is live) |
-| `done` | Completed |
-| `cancelled` | Will not be done |
-
-Acquiring a task sets it to `in_progress` automatically. All other transitions are explicit via `tasks update --status`.
-
-### Task ID format
-
-IDs look like `0003-fix-auth-bug`: a zero-padded 4-digit number followed by a kebab-case slug. Always use the full ID in commands. When creating with `--id`, supply only the slug — the number is assigned automatically.
+See README for the full command reference, status values, task ID format, and installation instructions.
