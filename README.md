@@ -67,7 +67,27 @@ tasks list --all --json
 | `--status` | Filter to one status: `open`, `in_progress`, `done`, `cancelled` |
 | `--parent <id>` | Show only direct children of this parent task |
 | `--all` | Include every status (overrides `--status`) |
+| `--tree` | Display tasks as an indented hierarchy grouped by parent |
 | `--json` | Machine-readable JSON array with full fields and live lock info |
+
+---
+
+### `search`
+
+Full-text search across task titles and descriptions.
+
+```
+tasks search "rate limiting"
+tasks search "auth" --status open
+tasks search "schema" --parent 0005-migrate-schema
+tasks search "jwt" --json
+```
+
+| Flag | Description |
+|---|---|
+| `--status` | Limit results to one status: `open`, `in_progress`, `done`, `cancelled` |
+| `--parent <id>` | Limit results to children of this parent task |
+| `--json` | Output results as a JSON array |
 
 ---
 
@@ -78,6 +98,17 @@ Print all fields for a single task, including lock holder and expiry if locked.
 ```
 tasks show 0003-fix-auth-bug
 tasks show 0003-fix-auth-bug --json
+```
+
+---
+
+### `log`
+
+Show the event history for a task: status transitions, lock acquisitions, releases, and updates.
+
+```
+tasks log 0003-fix-auth-bug
+tasks log 0003-fix-auth-bug --json
 ```
 
 ---
@@ -153,6 +184,22 @@ Extend the expiry of a lock you already hold. The new TTL starts from now.
 ```
 tasks renew 0003-fix-auth-bug --ttl 3600
 ```
+
+---
+
+### `close`
+
+Complete a task in one step: sets the summary, releases the lock, and marks the task `done`.
+
+```
+tasks close 0003-fix-auth-bug --summary "Patched JWT expiry check in auth.rs; added regression test"
+tasks close 0003-fix-auth-bug --summary "..." --holder worker-1
+```
+
+| Flag | Description |
+|---|---|
+| `--summary` | Closing record of decisions and outcomes |
+| `--holder` | Identity releasing the lock (falls back to `$TASK_HOLDER`) |
 
 ---
 

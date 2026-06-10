@@ -15,3 +15,5 @@ targets = ["aarch64-pc-windows-msvc", "x86_64-pc-windows-msvc"]
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# Message shown after successful install
+install-success-msg = "tasks is installed!\nEnable tab-completion: tasks completions powershell | Out-File -Append $PROFILE"

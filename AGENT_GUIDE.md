@@ -106,8 +106,8 @@ A worker receives a task ID from an orchestrator, acquires it, does the work, an
 
 Set a unique identity once at the start of your session:
 
-```
-export TASK_HOLDER="worker-1"   # or any stable unique name
+```powershell
+$env:TASK_HOLDER = "worker-1"   # or any stable unique name
 ```
 
 All lock operations (`acquire`, `release`, `renew`) use this identity. If two agents share the same identity they share lock ownership — intentional only when the same logical worker restarts.
@@ -142,19 +142,18 @@ tasks renew 0003-fix-auth-bug --ttl 3600
 
 ### Finishing a task
 
-Before releasing, record what you did with `--summary`. This is your closing record — decisions made, approach taken, caveats, anything useful for someone reading the task later. Keep it to 1–3 sentences. It is separate from `--description`, which is the upfront brief written by whoever created the task.
+Use `tasks close` to complete a task in one step. Pass `--summary` with your closing record — decisions made, approach taken, caveats, anything useful for someone reading the task later. Keep it to 1–3 sentences. It is separate from `--description`, which is the upfront brief written by whoever created the task.
+
+```
+tasks close 0003-fix-auth-bug --summary "Patched JWT expiry check in auth.rs; added regression test in auth_test.rs"
+```
+
+`close` does three things internally: sets the summary, releases the lock, and marks the task `done`. If you need finer control or want to understand what is happening under the hood, you can run the steps individually:
 
 ```
 tasks update 0003-fix-auth-bug --summary "Patched JWT expiry check in auth.rs; added regression test in auth_test.rs"
 tasks release 0003-fix-auth-bug
 tasks update  0003-fix-auth-bug --status done
-```
-
-You can also set status and summary in one call:
-
-```
-tasks update 0003-fix-auth-bug --summary "Chose approach X over Y due to Z" --status done
-tasks release 0003-fix-auth-bug
 ```
 
 ### Abandoning a task (returning it to the queue)
