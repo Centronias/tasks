@@ -377,6 +377,31 @@ fn print_task_human(task: &models::Task) {
     }
 }
 
+fn print_node(
+    task: &models::Task,
+    children: &std::collections::HashMap<Option<&str>, Vec<&models::Task>>,
+    prefix: &str,
+    is_last: bool,
+) {
+    let connector = if is_last { "└─ " } else { "├─ " };
+    let lock = if task.locked_by.is_some() {
+        " 🔒"
+    } else {
+        ""
+    };
+    println!(
+        "{prefix}{connector}[{}] {} {}{lock}",
+        task.status, task.id, task.title
+    );
+
+    let child_prefix = format!("{}{}", prefix, if is_last { "   " } else { "│  " });
+    if let Some(kids) = children.get(&Some(task.id.as_str())) {
+        for (i, kid) in kids.iter().enumerate() {
+            print_node(kid, children, &child_prefix, i == kids.len() - 1);
+        }
+    }
+}
+
 fn print_tree(tasks: &[models::Task], root_parent: Option<&str>) {
     use std::collections::HashMap;
 
@@ -387,31 +412,6 @@ fn print_tree(tasks: &[models::Task], root_parent: Option<&str>) {
             .entry(task.parent_id.as_deref())
             .or_default()
             .push(task);
-    }
-
-    fn print_node(
-        task: &models::Task,
-        children: &HashMap<Option<&str>, Vec<&models::Task>>,
-        prefix: &str,
-        is_last: bool,
-    ) {
-        let connector = if is_last { "└─ " } else { "├─ " };
-        let lock = if task.locked_by.is_some() {
-            " 🔒"
-        } else {
-            ""
-        };
-        println!(
-            "{prefix}{connector}[{}] {} {}{lock}",
-            task.status, task.id, task.title
-        );
-
-        let child_prefix = format!("{}{}", prefix, if is_last { "   " } else { "│  " });
-        if let Some(kids) = children.get(&Some(task.id.as_str())) {
-            for (i, kid) in kids.iter().enumerate() {
-                print_node(kid, children, &child_prefix, i == kids.len() - 1);
-            }
-        }
     }
 
     // Get top-level tasks (those whose parent matches root_parent)
