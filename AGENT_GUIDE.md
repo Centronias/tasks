@@ -71,6 +71,12 @@ tasks update  0005-migrate-schema --status done
 tasks list --status in_progress --json
 ```
 
+Use `--count` for a quick backlog-size check — it prints only the integer count of matching tasks:
+
+```
+tasks list --status open --count
+```
+
 For large backlogs, `--limit` and `--offset` are available on both `tasks list` and `tasks search` to page through results. For example:
 
 ```

@@ -47,6 +47,40 @@ impl FromStr for Status {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum Priority {
+    Low,
+    #[default]
+    Medium,
+    High,
+    Critical,
+}
+
+impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Low => write!(f, "low"),
+            Self::Medium => write!(f, "medium"),
+            Self::High => write!(f, "high"),
+            Self::Critical => write!(f, "critical"),
+        }
+    }
+}
+
+impl FromStr for Priority {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "low" => Ok(Self::Low),
+            "medium" => Ok(Self::Medium),
+            "high" => Ok(Self::High),
+            "critical" => Ok(Self::Critical),
+            other => Err(format!("unknown priority: {other}")),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
@@ -56,6 +90,7 @@ pub struct Task {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary: Option<String>,
     pub status: Status,
+    pub priority: Priority,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -68,7 +103,7 @@ pub struct Task {
 
 #[cfg(test)]
 mod tests {
-    use super::Status;
+    use super::{Priority, Status};
     use rstest::rstest;
 
     #[rstest]
@@ -84,6 +119,26 @@ mod tests {
     #[test]
     fn status_from_str_invalid() {
         assert!("pending".parse::<Status>().is_err());
+    }
+
+    #[rstest]
+    #[case(Priority::Low, "low")]
+    #[case(Priority::Medium, "medium")]
+    #[case(Priority::High, "high")]
+    #[case(Priority::Critical, "critical")]
+    fn priority_display_roundtrip(#[case] priority: Priority, #[case] s: &str) {
+        assert_eq!(priority.to_string(), s);
+        assert_eq!(s.parse::<Priority>().unwrap(), priority);
+    }
+
+    #[test]
+    fn priority_from_str_invalid() {
+        assert!("urgent".parse::<Priority>().is_err());
+    }
+
+    #[test]
+    fn priority_default_is_medium() {
+        assert_eq!(Priority::default(), Priority::Medium);
     }
 }
 

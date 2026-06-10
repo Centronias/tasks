@@ -72,6 +72,7 @@ tasks list --all --json
 | `--limit <N>` | Return at most N results (useful for large backlogs) |
 | `--offset <N>` | Skip the first N results (use with `--limit` to paginate) |
 | `--sort <field>` | Sort order: `num` (default), `updated`, `created`, `status` |
+| `--count`         | Print only the integer count of matching tasks |
 
 ---
 
@@ -94,6 +95,7 @@ tasks search "jwt" --json
 | `--limit <N>` | Return at most N results (useful for large backlogs) |
 | `--offset <N>` | Skip the first N results (use with `--limit` to paginate) |
 | `--sort <field>` | Sort order: `num` (default), `updated`, `created`, `status` |
+| `--count`         | Print only the integer count of matching tasks |
 
 ---
 

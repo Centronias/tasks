@@ -27,7 +27,7 @@ mod db;
 mod models;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use models::{SortBy, Status};
+use models::{Priority, SortBy, Status};
 
 /// CLI for managing tasks handed off to LLM agents.
 ///
@@ -92,6 +92,11 @@ enum Command {
         /// Optional closing summary (decisions, approach, caveats).
         #[arg(long)]
         summary: Option<String>,
+
+        /// Priority level for this task.
+        /// Accepted values: `low`, `medium` (default), `high`, `critical`.
+        #[arg(long, default_value = "medium")]
+        priority: Priority,
     },
 
     /// List tasks, optionally filtered by status and/or parent.
@@ -147,6 +152,11 @@ enum Command {
         /// Print only the count of matching tasks.
         #[arg(long)]
         count: bool,
+
+        /// Filter by priority level.
+        /// Accepted values: `low`, `medium`, `high`, `critical`.
+        #[arg(long)]
+        priority: Option<Priority>,
     },
 
     /// Show full details for a single task.
@@ -187,6 +197,11 @@ enum Command {
         /// Set this before releasing the lock to leave a record of outcomes.
         #[arg(long)]
         summary: Option<String>,
+
+        /// Update the priority level.
+        /// Accepted values: `low`, `medium`, `high`, `critical`.
+        #[arg(long)]
+        priority: Option<Priority>,
     },
 
     /// Delete a task permanently.
@@ -327,6 +342,11 @@ enum Command {
         /// Print only the count of matching tasks.
         #[arg(long)]
         count: bool,
+
+        /// Filter by priority level.
+        /// Accepted values: `low`, `medium`, `high`, `critical`.
+        #[arg(long)]
+        priority: Option<Priority>,
     },
 
     /// Complete a task in one step: optionally set summary, release the lock, and mark done.
@@ -539,6 +559,7 @@ fn main() -> anyhow::Result<()> {
             id,
             parent,
             summary,
+            priority,
         } => {
             let title = title.or(title_pos).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -552,9 +573,10 @@ fn main() -> anyhow::Result<()> {
                 &title,
                 description.as_deref(),
                 parent.as_deref(),
+                priority,
             )?;
             if let Some(s) = summary {
-                db::update_task(&conn, &full_id, None, None, None, Some(s.as_str()))?;
+                db::update_task(&conn, &full_id, None, None, None, Some(s.as_str()), None)?;
             }
             println!("{full_id}");
         }
@@ -569,14 +591,23 @@ fn main() -> anyhow::Result<()> {
             offset,
             sort,
             count,
+            priority,
         } => {
             if tree && json {
                 anyhow::bail!("--tree and --json cannot be used together");
             }
             if tree {
                 // Fetch all tasks (ignoring parent filter for tree — we show the whole tree)
-                let tasks =
-                    db::list_tasks(&conn, status.as_ref(), None, true, None, None, SortBy::Num)?;
+                let tasks = db::list_tasks(
+                    &conn,
+                    status.as_ref(),
+                    None,
+                    true,
+                    None,
+                    None,
+                    SortBy::Num,
+                    None,
+                )?;
                 print_tree(&tasks, parent.as_deref());
             } else {
                 let tasks = db::list_tasks(
@@ -587,6 +618,7 @@ fn main() -> anyhow::Result<()> {
                     limit,
                     offset,
                     sort,
+                    priority.as_ref(),
                 )?;
                 if count {
                     println!("{}", tasks.len());
@@ -640,10 +672,16 @@ fn main() -> anyhow::Result<()> {
             description,
             status,
             summary,
+            priority,
         } => {
-            if title.is_none() && description.is_none() && status.is_none() && summary.is_none() {
+            if title.is_none()
+                && description.is_none()
+                && status.is_none()
+                && summary.is_none()
+                && priority.is_none()
+            {
                 anyhow::bail!(
-                    "at least one of --title, --description, --status, --summary is required"
+                    "at least one of --title, --description, --status, --summary, --priority is required"
                 );
             }
             let id = db::resolve_id(&conn, &id)?;
@@ -654,6 +692,7 @@ fn main() -> anyhow::Result<()> {
                 description.as_deref(),
                 status.as_ref(),
                 summary.as_deref(),
+                priority,
             )?;
             if !found {
                 anyhow::bail!("task not found: {id}");
@@ -727,6 +766,7 @@ fn main() -> anyhow::Result<()> {
             offset,
             sort,
             count,
+            priority,
         } => {
             let tasks = db::search_tasks(
                 &conn,
@@ -736,6 +776,7 @@ fn main() -> anyhow::Result<()> {
                 limit,
                 offset,
                 sort,
+                priority.as_ref(),
             )?;
             if count {
                 println!("{}", tasks.len());
@@ -777,7 +818,7 @@ fn main() -> anyhow::Result<()> {
             let holder = resolve_holder(holder)?;
             // Optionally set summary first.
             if let Some(s) = summary {
-                let found = db::update_task(&conn, &id, None, None, None, Some(s.as_str()))?;
+                let found = db::update_task(&conn, &id, None, None, None, Some(s.as_str()), None)?;
                 if !found {
                     anyhow::bail!("task not found: {id}");
                 }
@@ -785,7 +826,7 @@ fn main() -> anyhow::Result<()> {
             // Release the lock (fails if held by a different holder).
             db::release_task(&conn, &id, &holder, false)?;
             // Mark done.
-            let found = db::update_task(&conn, &id, None, None, Some(&Status::Done), None)?;
+            let found = db::update_task(&conn, &id, None, None, Some(&Status::Done), None, None)?;
             if !found {
                 anyhow::bail!("task not found: {id}");
             }
@@ -827,7 +868,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Command::Export { all, output } => {
-            let tasks = db::list_tasks(&conn, None, None, all, None, None, SortBy::Num)?;
+            let tasks = db::list_tasks(&conn, None, None, all, None, None, SortBy::Num, None)?;
             let json = serde_json::to_string_pretty(&tasks)?;
             match output {
                 Some(path) => std::fs::write(&path, &json)
