@@ -75,6 +75,14 @@ The JSON output includes `locked_by` and `lock_expires` per task. Use `tasks sho
 
 ### Recovering a stalled worker
 
+Run `tasks gc` at the start of each orchestration loop to automatically recover all tasks with expired locks in one call:
+
+```
+tasks gc
+```
+
+This resets every stalled task to open without needing to identify each one individually. Use `tasks release --force` only when you need to recover a task whose lock has not yet expired (e.g. a worker that is known dead but still holds a live lock).
+
 If a lock has expired or the worker is known dead, force-release and reassign:
 
 ```
@@ -114,22 +122,17 @@ All lock operations (`acquire`, `release`, `renew`) use this identity. If two ag
 
 ### Picking up a task
 
-If you were given a specific task ID, go straight to acquire. If you are picking freely from the queue:
+For workers picking freely from the queue, `tasks next` is the preferred approach — it atomically finds and acquires the first open task in one step, eliminating any race window:
+
+```
+tasks next
+```
+
+If you need to pick a specific task (e.g. one assigned by an orchestrator), use the two-step approach:
 
 ```
 tasks list --status open
-```
-
-Then acquire:
-
-```
 tasks acquire 0003-fix-auth-bug
-```
-
-This sets status to `in_progress` and places a lock. Default TTL is 3600 s. For longer work:
-
-```
-tasks acquire 0003-fix-auth-bug --ttl 7200
 ```
 
 ### Renewing a lock

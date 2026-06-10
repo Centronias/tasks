@@ -161,6 +161,25 @@ tasks acquire 0003-fix-auth-bug --ttl 7200
 
 ---
 
+### `next`
+
+Atomically find and acquire the next open task. Prints the task as JSON. Exits 1 if no open tasks are available.
+
+```
+tasks next
+tasks next --parent 0005-migrate-schema
+tasks next --ttl 7200
+tasks next --holder worker-1
+```
+
+| Flag | Description |
+|---|---|
+| `--parent <id>` | Restrict to children of this parent task |
+| `--ttl` | Lock duration in seconds (default: 3600) |
+| `--holder` | Identity of the acquiring agent (falls back to `$TASK_HOLDER`) |
+
+---
+
 ### `release`
 
 Release a lock. Does not change task status — update status separately.
@@ -200,6 +219,21 @@ tasks close 0003-fix-auth-bug --summary "..." --holder worker-1
 |---|---|
 | `--summary` | Closing record of decisions and outcomes |
 | `--holder` | Identity releasing the lock (falls back to `$TASK_HOLDER`) |
+
+---
+
+### `gc`
+
+Reap expired locks and reset stalled `in_progress` tasks back to `open`. Use `--dry-run` to preview what would change without making any modifications.
+
+```
+tasks gc
+tasks gc --dry-run
+```
+
+| Flag | Description |
+|---|---|
+| `--dry-run` | Preview affected tasks without making any changes |
 
 ---
 
