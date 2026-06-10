@@ -143,6 +143,10 @@ enum Command {
         /// Accepted values: `num` (default), `updated`, `created`, `status`.
         #[arg(long, default_value = "num")]
         sort: SortBy,
+
+        /// Print only the count of matching tasks.
+        #[arg(long)]
+        count: bool,
     },
 
     /// Show full details for a single task.
@@ -319,6 +323,10 @@ enum Command {
         /// Accepted values: `num` (default), `updated`, `created`, `status`.
         #[arg(long, default_value = "num")]
         sort: SortBy,
+
+        /// Print only the count of matching tasks.
+        #[arg(long)]
+        count: bool,
     },
 
     /// Complete a task in one step: optionally set summary, release the lock, and mark done.
@@ -560,6 +568,7 @@ fn main() -> anyhow::Result<()> {
             limit,
             offset,
             sort,
+            count,
         } => {
             if tree && json {
                 anyhow::bail!("--tree and --json cannot be used together");
@@ -579,6 +588,10 @@ fn main() -> anyhow::Result<()> {
                     offset,
                     sort,
                 )?;
+                if count {
+                    println!("{}", tasks.len());
+                    return Ok(());
+                }
                 if json {
                     println!("{}", serde_json::to_string_pretty(&tasks)?);
                 } else {
@@ -713,6 +726,7 @@ fn main() -> anyhow::Result<()> {
             limit,
             offset,
             sort,
+            count,
         } => {
             let tasks = db::search_tasks(
                 &conn,
@@ -723,6 +737,10 @@ fn main() -> anyhow::Result<()> {
                 offset,
                 sort,
             )?;
+            if count {
+                println!("{}", tasks.len());
+                return Ok(());
+            }
             if json {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else {

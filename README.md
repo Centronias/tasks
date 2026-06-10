@@ -71,6 +71,7 @@ tasks list --all --json
 | `--json` | Machine-readable JSON array with full fields and live lock info |
 | `--limit <N>` | Return at most N results (useful for large backlogs) |
 | `--offset <N>` | Skip the first N results (use with `--limit` to paginate) |
+| `--sort <field>` | Sort order: `num` (default), `updated`, `created`, `status` |
 
 ---
 
@@ -92,6 +93,7 @@ tasks search "jwt" --json
 | `--json` | Output results as a JSON array |
 | `--limit <N>` | Return at most N results (useful for large backlogs) |
 | `--offset <N>` | Skip the first N results (use with `--limit` to paginate) |
+| `--sort <field>` | Sort order: `num` (default), `updated`, `created`, `status` |
 
 ---
 
@@ -271,7 +273,7 @@ tasks export --all --output backup.json
 
 ### `import`
 
-Load tasks from a JSON file previously created by `export`. Reads from stdin if no file is given.
+Load tasks from a JSON file previously created by `export`. Reads from stdin if no file is given. Tasks whose IDs already exist in the database are skipped; a summary is printed on completion (e.g. `imported 5, skipped 2 (already exist)`).
 
 ```
 tasks import backup.json
