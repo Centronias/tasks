@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::models::{Lock, Status, Task};
+use crate::models::{Lock, Status, Task, TaskStats};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -140,8 +140,12 @@ pub fn list_tasks(
     conn: &Connection,
     status_filter: Option<&Status>,
     parent_filter: Option<&str>,
+    show_all: bool,
 ) -> rusqlite::Result<Vec<Task>> {
     let now = Utc::now().to_rfc3339();
+    // When show_all is true  → no status restriction.
+    // When status_filter is Some(s) → restrict to that exact status.
+    // Otherwise (default)   → show only open and in_progress tasks.
     let sql = "SELECT t.id, t.num, t.title, t.description, t.status,
                       t.created_at, t.updated_at,
                       CASE WHEN l.expires_at > ?1 THEN l.holder END,
@@ -149,12 +153,20 @@ pub fn list_tasks(
                       t.parent_id
                FROM tasks t
                LEFT JOIN locks l ON l.task_id = t.id
-               WHERE (?2 IS NULL OR t.status = ?2)
+               WHERE (
+                   ?4 = 1
+                   OR (?2 IS NOT NULL AND t.status = ?2)
+                   OR (?2 IS NULL AND t.status IN ('open', 'in_progress'))
+               )
                  AND (?3 IS NULL OR t.parent_id = ?3)
                ORDER BY t.num ASC";
     let status_val = status_filter.map(ToString::to_string);
+    let show_all_int: i32 = i32::from(show_all);
     let mut stmt = conn.prepare(sql)?;
-    let rows = stmt.query_map(params![now, status_val, parent_filter], row_to_task)?;
+    let rows = stmt.query_map(
+        params![now, status_val, parent_filter, show_all_int],
+        row_to_task,
+    )?;
     rows.collect()
 }
 
@@ -212,6 +224,39 @@ pub fn delete_task(conn: &Connection, id: &str, force: bool) -> anyhow::Result<b
     }
     let rows = conn.execute("DELETE FROM tasks WHERE id = ?1", [id])?;
     Ok(rows > 0)
+}
+
+/// Resolve a partial (or full) task ID to an exact ID.
+///
+/// - If `partial` matches an existing ID exactly, return it as-is.
+/// - Otherwise, look for all IDs containing `partial` as a substring
+///   (`LIKE '%partial%'`).
+///   - Exactly one match → return it.
+///   - Zero matches → error "no task found matching '…'".
+///   - Multiple matches → error "ambiguous ID '…' matches: …".
+pub fn resolve_id(conn: &Connection, partial: &str) -> anyhow::Result<String> {
+    // Fast path: exact match.
+    let exact: Option<String> = conn
+        .query_row("SELECT id FROM tasks WHERE id = ?1", [partial], |r| {
+            r.get(0)
+        })
+        .optional()?;
+    if let Some(id) = exact {
+        return Ok(id);
+    }
+
+    // Substring match.
+    let pattern = format!("%{partial}%");
+    let mut stmt = conn.prepare("SELECT id FROM tasks WHERE id LIKE ?1 ORDER BY id")?;
+    let matches: Vec<String> = stmt
+        .query_map([&pattern], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    match matches.len() {
+        0 => anyhow::bail!("no task found matching '{partial}'"),
+        1 => Ok(matches.into_iter().next().unwrap()),
+        _ => anyhow::bail!("ambiguous ID '{partial}' matches: {}", matches.join(", ")),
+    }
 }
 
 pub fn acquire_task(conn: &Connection, id: &str, holder: &str, ttl: u64) -> anyhow::Result<()> {
@@ -329,11 +374,88 @@ pub fn renew_task(conn: &Connection, id: &str, holder: &str, ttl: u64) -> anyhow
     Ok(())
 }
 
+pub fn stats(conn: &Connection) -> anyhow::Result<TaskStats> {
+    let now = Utc::now().to_rfc3339();
+
+    // Single pass for status counts, completion rate, abandonment proxy, and
+    // child-task usage.  The abandonment heuristic flags open tasks whose
+    // updated_at is more than 5 seconds after created_at — a sign the task was
+    // returned to the queue after an agent touched it.
+    let (
+        total,
+        open,
+        in_progress,
+        done,
+        cancelled,
+        completion_pct,
+        likely_abandoned,
+        child_tasks,
+        parent_tasks,
+    ) = conn.query_row(
+        "SELECT
+               COUNT(*)                                                        AS total,
+               COUNT(*) FILTER (WHERE status = 'open')                        AS open_count,
+               COUNT(*) FILTER (WHERE status = 'in_progress')                 AS in_progress_count,
+               COUNT(*) FILTER (WHERE status = 'done')                        AS done_count,
+               COUNT(*) FILTER (WHERE status = 'cancelled')                   AS cancelled_count,
+               ROUND(
+                 100.0 * COUNT(*) FILTER (WHERE status = 'done')
+                 / NULLIF(COUNT(*) FILTER (WHERE status != 'cancelled'), 0),
+                 1
+               )                                                               AS completion_pct,
+               COUNT(*) FILTER (
+                 WHERE status = 'open'
+                   AND (strftime('%s', updated_at) - strftime('%s', created_at)) > 5
+               )                                                               AS likely_abandoned,
+               COUNT(*) FILTER (WHERE parent_id IS NOT NULL)                  AS child_tasks,
+               COUNT(DISTINCT parent_id) FILTER (WHERE parent_id IS NOT NULL) AS parent_tasks
+             FROM tasks",
+        [],
+        |r| {
+            Ok((
+                r.get::<_, i64>(0)?,
+                r.get::<_, i64>(1)?,
+                r.get::<_, i64>(2)?,
+                r.get::<_, i64>(3)?,
+                r.get::<_, i64>(4)?,
+                r.get::<_, Option<f64>>(5)?,
+                r.get::<_, i64>(6)?,
+                r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)?,
+            ))
+        },
+    )?;
+
+    // Stall count: in_progress tasks whose lock has expired or has no lock row.
+    let stalled: i64 = conn.query_row(
+        "SELECT COUNT(*)
+         FROM tasks t
+         LEFT JOIN locks l ON l.task_id = t.id
+         WHERE t.status = 'in_progress'
+           AND (l.expires_at IS NULL OR l.expires_at < ?1)",
+        params![now],
+        |r| r.get(0),
+    )?;
+
+    Ok(TaskStats {
+        total,
+        open,
+        in_progress,
+        done,
+        cancelled,
+        completion_pct,
+        likely_abandoned,
+        stalled,
+        child_tasks,
+        parent_tasks,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         acquire_task, create_task, delete_task, get_task, list_tasks, migrate, release_task,
-        renew_task, slugify, update_task,
+        renew_task, resolve_id, slugify, update_task,
     };
     use crate::models::Status;
     use chrono::Utc;
@@ -462,7 +584,7 @@ mod tests {
 
     #[rstest]
     fn list_empty(conn: Connection) {
-        assert!(list_tasks(&conn, None, None).unwrap().is_empty());
+        assert!(list_tasks(&conn, None, None, false).unwrap().is_empty());
     }
 
     #[rstest]
@@ -470,7 +592,7 @@ mod tests {
         create_task(&conn, "a", "A", None, None).unwrap();
         create_task(&conn, "b", "B", None, None).unwrap();
         create_task(&conn, "c", "C", None, None).unwrap();
-        let tasks = list_tasks(&conn, None, None).unwrap();
+        let tasks = list_tasks(&conn, None, None, false).unwrap();
         assert_eq!(tasks.len(), 3);
         assert!(tasks[0].num < tasks[1].num);
         assert!(tasks[1].num < tasks[2].num);
@@ -491,7 +613,7 @@ mod tests {
         update_task(&conn, &id3, None, None, Some(&Status::Done)).unwrap();
         update_task(&conn, &id4, None, None, Some(&Status::Cancelled)).unwrap();
 
-        let tasks = list_tasks(&conn, Some(&filter), None).unwrap();
+        let tasks = list_tasks(&conn, Some(&filter), None, false).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, filter);
     }
@@ -504,7 +626,7 @@ mod tests {
         let c2 = create_task(&conn, "child-2", "Child 2", None, Some(parent.as_str())).unwrap();
         create_task(&conn, "unrelated", "Unrelated", None, Some(other.as_str())).unwrap();
 
-        let children = list_tasks(&conn, None, Some(parent.as_str())).unwrap();
+        let children = list_tasks(&conn, None, Some(parent.as_str()), false).unwrap();
         assert_eq!(children.len(), 2);
         assert!(children.iter().any(|t| t.id == c1));
         assert!(children.iter().any(|t| t.id == c2));
@@ -654,6 +776,46 @@ mod tests {
         acquire_task(&conn, &id, "agent1", 3600).unwrap();
         release_task(&conn, &id, "agent2", true).unwrap();
         assert!(get_task(&conn, &id).unwrap().unwrap().locked_by.is_none());
+    }
+
+    // ── resolve_id ────────────────────────────────────────────────────────────
+
+    #[rstest]
+    fn resolve_id_exact_match(conn: Connection) {
+        let id = create_task(&conn, "fix-login", "Fix Login", None, None).unwrap();
+        assert_eq!(resolve_id(&conn, &id).unwrap(), id);
+    }
+
+    #[rstest]
+    fn resolve_id_prefix_match(conn: Connection) {
+        let id = create_task(&conn, "fix-login", "Fix Login", None, None).unwrap();
+        // id looks like "0001-fix-login"; prefix "0001" should resolve it
+        let resolved = resolve_id(&conn, "0001").unwrap();
+        assert_eq!(resolved, id);
+    }
+
+    #[rstest]
+    fn resolve_id_substring_match(conn: Connection) {
+        let id = create_task(&conn, "fix-login", "Fix Login", None, None).unwrap();
+        let resolved = resolve_id(&conn, "fix-login").unwrap();
+        assert_eq!(resolved, id);
+    }
+
+    #[rstest]
+    fn resolve_id_not_found_errors(conn: Connection) {
+        let err = resolve_id(&conn, "no-such-task").unwrap_err();
+        assert!(err.to_string().contains("no task found matching"));
+        assert!(err.to_string().contains("no-such-task"));
+    }
+
+    #[rstest]
+    fn resolve_id_ambiguous_errors(conn: Connection) {
+        create_task(&conn, "fix-login", "Fix Login", None, None).unwrap();
+        create_task(&conn, "fix-signup", "Fix Signup", None, None).unwrap();
+        // "fix" appears in both IDs
+        let err = resolve_id(&conn, "fix").unwrap_err();
+        assert!(err.to_string().contains("ambiguous"));
+        assert!(err.to_string().contains("fix"));
     }
 
     // ── renew_task ────────────────────────────────────────────────────────────

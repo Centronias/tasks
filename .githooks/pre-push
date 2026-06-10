@@ -1,0 +1,33 @@
+#!/bin/sh
+# pre-push hook: enforces that any v* tag being pushed matches the version in Cargo.toml.
+#
+# Activate on Windows (or any system where core.hooksPath isn't set):
+#   git config core.hooksPath .githooks
+#
+# The hook reads from stdin the list of refs being pushed (format: <local-ref> <local-sha1> <remote-ref> <remote-sha1>).
+# It aborts the push if a v* tag is being pushed whose version does not match the version in Cargo.toml.
+
+cargo_version=$(grep '^version' Cargo.toml | head -1 | sed 's/.*"\(.*\)"/\1/')
+
+if [ -z "$cargo_version" ]; then
+    echo "pre-push: ERROR: could not read version from Cargo.toml" >&2
+    exit 1
+fi
+
+expected_tag="v${cargo_version}"
+
+while read local_ref local_sha remote_ref remote_sha; do
+    # Extract the tag name from refs/tags/<name>
+    case "$local_ref" in
+        refs/tags/v*)
+            tag_name="${local_ref#refs/tags/}"
+            if [ "$tag_name" != "$expected_tag" ]; then
+                echo "pre-push: ERROR: pushing tag '$tag_name' but Cargo.toml version is '$cargo_version' (expected tag '$expected_tag')." >&2
+                echo "pre-push: Update Cargo.toml to match the tag, or push '$expected_tag' instead." >&2
+                exit 1
+            fi
+            ;;
+    esac
+done
+
+exit 0

@@ -81,3 +81,32 @@ pub struct Lock {
     pub acquired_at: DateTime<Utc>,
     pub expires_at: DateTime<Utc>,
 }
+
+/// Aggregate metrics about the task database, returned by `tasks stats`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct TaskStats {
+    /// Total number of tasks (all statuses).
+    pub total: i64,
+    /// Tasks currently open.
+    pub open: i64,
+    /// Tasks currently `in_progress`.
+    pub in_progress: i64,
+    /// Tasks marked done.
+    pub done: i64,
+    /// Tasks marked cancelled.
+    pub cancelled: i64,
+    /// Percentage of non-cancelled tasks that reached `done`. Null when there
+    /// are no non-cancelled tasks yet.
+    pub completion_pct: Option<f64>,
+    /// Open tasks whose `updated_at` is more than 5 seconds after `created_at`,
+    /// used as a proxy for tasks that were returned to the queue after an
+    /// agent started work on them.
+    pub likely_abandoned: i64,
+    /// In-progress tasks whose lock has expired (or has no lock record at all) —
+    /// a proxy for stalled or dead agents.
+    pub stalled: i64,
+    /// Tasks that have a `parent_id` set (i.e. are children of another task).
+    pub child_tasks: i64,
+    /// Distinct parent tasks that have at least one child.
+    pub parent_tasks: i64,
+}

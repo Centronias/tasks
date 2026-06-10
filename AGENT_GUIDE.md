@@ -1,233 +1,224 @@
 # Task CLI — Agent Guide
 
-This guide is written for LLM agents that use the `tasks` CLI to coordinate work, including delegating to sub-agents.
+---
 
-## Prerequisites
+## Part 1: Orchestrator
 
-`tasks` must be installed as a global CLI tool and available on your `PATH`. Verify with:
+An orchestrator manages the backlog. Its only actions are: create tasks, spawn worker sub-agents, monitor progress, recover stalls, and close out completed work. **It never acquires tasks, writes code, edits files, or does any implementation work itself.** Anything that needs doing becomes a task delegated to a worker.
+
+### Prerequisites
+
+`tasks` must be installed as a global CLI tool on `PATH`. Verify:
 
 ```
 tasks --help
 ```
 
-If the command is not found, ask a human to install it — **do not use a local development copy** (e.g. `./target/release/tasks` or `cargo run`). Local builds may be out of date, differ in behavior, or write to a different database than the one other agents are using.
+If not found, ask a human to install it. Do not use a local dev copy (`./target/release/tasks`, `cargo run`, etc.) — it may be stale or write to a different database.
 
-## Identity
+### Setup
 
-Every agent must have a unique identity. Set it once at the start of your session:
-
-```
-export TASK_HOLDER="your-agent-id"
-```
-
-All lock operations (`acquire`, `release`, `renew`) use this identity. Pick something stable and unique — e.g. `orchestrator`, `subagent-auth`, `worker-1`. If two agents share the same identity they will share lock ownership, which is sometimes intentional (same logical worker restarting) and sometimes a bug.
-
-## Setup
-
-Run this once before anything else. It is safe to run repeatedly:
+Run once before anything else (safe to re-run):
 
 ```
 tasks migrate
 ```
 
-## Task Sizing
+### Creating and delegating tasks
 
-Before acquiring a task, assess its scope. A well-sized task:
+Write a task for every unit of work you want to delegate. The `--description` is the worker's primary briefing — make it complete:
 
-- Has a single clear output (a file, a fix, a passing test suite)
-- Can be completed within one focused agent session without context pressure
-- Does not depend on the outcome of work that hasn't happened yet
+```
+tasks create --title "Add rate limiting to /api/login" \
+            --description "Sliding-window counter in Redis. Max 10 req/IP/min. Return 429 + Retry-After. Tests required."
+```
 
-**If a task is too large, decompose it before starting.** Create child tasks first (see [Decomposing a Task into Children](#decomposing-a-task-into-children)), then acquire the parent as a coordination task whose only job is to create children, monitor their progress, and mark itself done when all children are done. Do not attempt large tasks monolithically — you will either blow context or produce incomplete work.
+The command prints the assigned full ID (e.g. `0007-add-rate-limiting-to-api-login`). Pass that ID to the worker sub-agent. The worker sets its own `TASK_HOLDER` and calls `tasks acquire` itself — **the orchestrator must never acquire on a worker's behalf**.
 
-A useful heuristic: if writing the `--description` for a task requires more than three sentences, it probably needs to be split.
+### Parallelizing work
 
-## Core Workflow
+Create all tasks first, then launch workers concurrently. Each `acquire` is atomic — only one agent wins per task:
 
-### Pick up a task
+```
+tasks create --title "Migrate users table"    --description "..."
+tasks create --title "Migrate products table" --description "..."
+tasks create --title "Migrate orders table"   --description "..."
+
+# Launch three workers, each given one task ID
+```
+
+If two workers race for the same task, the loser gets an error and should pick a different open task.
+
+### Decomposing large tasks
+
+When a task is too large to delegate as a single unit, break it up before assigning anything. Create child tasks linked to the parent with `--parent`, then assign each child to its own worker:
+
+```
+tasks create --title "Write migration for users table"    --parent 0005-migrate-schema --description "..."
+tasks create --title "Write migration for products table" --parent 0005-migrate-schema --description "..."
+tasks create --title "Write migration for orders table"   --parent 0005-migrate-schema --description "..."
+```
+
+The parent task becomes a coordination marker. Acquire it yourself to signal it is active, then close it only once all children are done:
+
+```
+tasks acquire 0005-migrate-schema --holder orchestrator
+# ... workers complete children ...
+tasks list --parent 0005-migrate-schema --status open
+tasks list --parent 0005-migrate-schema --status in_progress
+# both empty → safe to close
+tasks release 0005-migrate-schema
+tasks update  0005-migrate-schema --status done
+```
+
+### Monitoring workers
+
+```
+tasks list --status in_progress --json
+```
+
+The JSON output includes `locked_by` and `lock_expires` per task. Use `tasks show <id>` for full detail on a specific task.
+
+### Recovering a stalled worker
+
+If a lock has expired or the worker is known dead, force-release and reassign:
+
+```
+tasks release 0007-add-rate-limiting-to-api-login --force
+tasks acquire 0007-add-rate-limiting-to-api-login --holder replacement-worker
+```
+
+`--force` bypasses the holder check — no need to impersonate the stalled agent.
+
+### Orchestrator mistakes to avoid
+
+**Acquiring tasks meant for workers.** The lock ends up under the wrong identity. The worker can't renew or release it cleanly.
+
+**Doing implementation work inline.** If you find yourself writing code, editing files, or running tests, stop — create a task and delegate it.
+
+**Marking a parent done with open children.** Always check `tasks list --parent <id> --status open` and `--status in_progress` before closing a parent.
+
+---
+
+## Part 2: Worker
+
+A worker receives a task ID from an orchestrator, acquires it, does the work, and closes out the task. It does not manage the backlog or spawn other workers (unless it discovers a task needs decomposing — see [Decomposing a task](#decomposing-a-task)).
+
+### Prerequisites
+
+Same as above — `tasks` must be a global CLI on `PATH`. Do not use a local dev copy.
+
+### Identity
+
+Set a unique identity once at the start of your session:
+
+```
+export TASK_HOLDER="worker-1"   # or any stable unique name
+```
+
+All lock operations (`acquire`, `release`, `renew`) use this identity. If two agents share the same identity they share lock ownership — intentional only when the same logical worker restarts.
+
+### Setup
+
+```
+tasks migrate
+```
+
+### Picking up a task
+
+If you were given a specific task ID, go straight to acquire. If you are picking freely from the queue:
 
 ```
 tasks list --status open
 ```
 
-Pick one, then acquire it. Acquiring sets the status to `in_progress` and places a lock so other agents leave it alone:
+Then acquire:
 
 ```
 tasks acquire 0003-fix-auth-bug
 ```
 
-The default lock TTL is 3600 seconds. If your work will take longer, set a longer TTL:
+This sets status to `in_progress` and places a lock. Default TTL is 3600 s. For longer work:
 
 ```
 tasks acquire 0003-fix-auth-bug --ttl 7200
 ```
 
-### Renew a lock you already hold
+### Renewing a lock
 
-If your work is taking longer than expected, renew before the lock expires. The new TTL starts from now:
+If your work is running long, renew before the lock expires (new TTL starts from now):
 
 ```
 tasks renew 0003-fix-auth-bug --ttl 3600
 ```
 
-### Finish a task
+### Finishing a task
 
-Release the lock and update the status in any order. Both steps are required — `release` alone does not change status:
+Release the lock and mark done — both steps are required, in either order:
 
 ```
 tasks release 0003-fix-auth-bug
 tasks update  0003-fix-auth-bug --status done
 ```
 
-If you want to leave a note about what was done, update the description before releasing:
+Optionally leave a note first:
 
 ```
-tasks update 0003-fix-auth-bug --description "Fixed by patching the JWT expiry check in auth.rs"
+tasks update 0003-fix-auth-bug --description "Fixed by patching JWT expiry check in auth.rs"
 tasks release 0003-fix-auth-bug
 tasks update  0003-fix-auth-bug --status done
 ```
 
-### Abandon a task (return it to the queue)
-
-Release the lock and reset to open so another agent can pick it up:
+### Abandoning a task (returning it to the queue)
 
 ```
 tasks release 0003-fix-auth-bug
 tasks update  0003-fix-auth-bug --status open
 ```
 
-## Decomposing a Task into Children
+### Decomposing a task
 
-Use child tasks when a task is too large to complete in one session, or when distinct parts of the work can proceed in parallel. Child tasks are linked to the parent with `--parent` so they can be queried and tracked as a group.
+If the task you acquired turns out to be too large, decompose it before doing any work. A well-sized task:
 
-### Creating child tasks
+- Has a single clear output
+- Can finish within one focused session without context pressure
+- Does not depend on work that hasn't happened yet
 
-Before acquiring the parent, create all the children you can identify:
+A useful heuristic: if explaining the task's acceptance criteria takes more than three sentences, split it.
 
-```
-tasks create --title "Write migration for users table" \
-            --description "Add columns: display_name (TEXT), verified_at (TEXT nullable)." \
-            --parent 0005-migrate-schema
-
-tasks create --title "Write migration for products table" \
-            --description "Add column: archived_at (TEXT nullable)." \
-            --parent 0005-migrate-schema
-
-tasks create --title "Write migration for orders table" \
-            --description "Add FK orders.user_id REFERENCES users(id)." \
-            --parent 0005-migrate-schema
-```
-
-Then acquire the parent as a coordination task:
+To decompose, create child tasks under the current task's ID, then notify the orchestrator that it needs to coordinate them (or handle coordination yourself if the orchestrator is not monitoring):
 
 ```
-tasks acquire 0005-migrate-schema
+tasks create --title "Sub-task A" --description "..." --parent 0003-fix-auth-bug
+tasks create --title "Sub-task B" --description "..." --parent 0003-fix-auth-bug
 ```
 
-Your role as coordinator is to spawn sub-agents for each child, monitor progress, and close out the parent when all children are done.
+Do not attempt large tasks monolithically — you will blow context or produce incomplete work.
 
-### Querying children
+### Follow-up tasks
 
-To see the status of all subtasks for a parent:
-
-```
-tasks list --parent 0005-migrate-schema
-tasks list --parent 0005-migrate-schema --status open
-tasks list --parent 0005-migrate-schema --json
-```
-
-### Closing out the parent
-
-Before marking the parent done, verify no children are still outstanding:
-
-```
-tasks list --parent 0005-migrate-schema --status open
-tasks list --parent 0005-migrate-schema --status in_progress
-```
-
-If both return empty, release and close the parent:
-
-```
-tasks release 0005-migrate-schema
-tasks update  0005-migrate-schema --status done
-```
-
-## Delegating to Sub-Agents
-
-### Creating tasks for sub-agents
-
-Create a task for each unit of work you want to delegate. Use `--description` to give the sub-agent full context — it is the primary briefing document:
-
-```
-tasks create --title "Add rate limiting to /api/login" \
-            --description "Use a sliding-window counter in Redis. Max 10 attempts per IP per minute. Return 429 with Retry-After header. Tests required."
-```
-
-The command prints the full ID (e.g. `0007-add-rate-limiting-to-api-login`). Pass that ID to the sub-agent.
-
-### Handing off to a sub-agent
-
-Tell the sub-agent its identity, the task ID, and that it should acquire before starting:
-
-```
-TASK_HOLDER=subagent-ratelimit tasks acquire 0007-add-rate-limiting-to-api-login
-```
-
-Or instruct the sub-agent to set its own `TASK_HOLDER` and call `tasks acquire` itself.
-
-### Monitoring sub-agent progress
-
-```
-tasks list --status in_progress --json
-```
-
-The JSON output includes `locked_by` and `lock_expires` so you can see which agent holds each task and when the lock expires.
-
-```
-tasks show 0007-add-rate-limiting-to-api-login
-```
-
-### Recovering a stalled sub-agent
-
-If a sub-agent's lock has expired (visible in `lock_expires`) or the agent is known to be dead, force-release the lock and reassign:
-
-```
-tasks release 0007-add-rate-limiting-to-api-login --force
-tasks acquire 0007-add-rate-limiting-to-api-login --holder replacement-agent
-```
-
-`--force` on release bypasses the holder check so you do not need to impersonate the stalled agent.
-
-## Parallelizing Work
-
-Create all tasks first, then have sub-agents acquire and work on them concurrently. Each `acquire` is atomic — only one agent will succeed per task:
-
-```
-tasks create --title "Migrate users table"    --description "..."  # prints 0008-migrate-users-table
-tasks create --title "Migrate products table" --description "..."  # prints 0009-migrate-products-table
-tasks create --title "Migrate orders table"   --description "..."  # prints 0010-migrate-orders-table
-
-# Launch three sub-agents, each targeting one task ID
-```
-
-If two agents race to acquire the same task, the second one gets an error showing who holds the lock — it should back off and pick a different open task.
-
-## Follow-up Tasks
-
-A follow-up task is work discovered during the execution of another task — a bug noticed, a missing index, a related cleanup. It is **not** a child of the task that discovered it; it stands alone in the backlog for any agent to pick up later.
-
-Create follow-up tasks immediately when you discover them, before you forget:
+If you notice unrelated work while executing your task (a bug, a missing index, a cleanup), create a standalone task for it immediately — **without** `--parent`:
 
 ```
 tasks create --title "Add index on users.email" \
-            --description "Discovered during the users migration — full-table scans on login are now visible in EXPLAIN."
+            --description "Discovered during migration — full-table scans on login now visible in EXPLAIN."
 ```
 
-Do not add a `--parent` flag. The relationship here is temporal (discovered while doing X), not structural (required to complete X). Mixing the two makes `tasks list --parent` unreliable as a completion-gating tool.
+The distinction: if the parent task cannot be marked `done` without this work, it is a child. If the parent can finish regardless, it is a follow-up that stands alone in the backlog.
 
-The rule of thumb: if the parent task cannot be marked `done` without this work finishing, it is a child task. If the parent can finish regardless, it is a follow-up.
+### Worker mistakes to avoid
 
-## Status Reference
+**Not releasing before marking done.** The lock and the status are independent. Always release; otherwise the task shows locked forever until TTL expires.
+
+**Forgetting to renew long-running work.** Default TTL is 1 hour. Set a longer TTL at acquire time or renew periodically for slow work.
+
+**Tagging follow-up tasks as children.** Mixing temporal and structural relationships makes `tasks list --parent` unreliable as a completion gate.
+
+---
+
+## Reference
+
+### Status values
 
 | Status | Meaning |
 |---|---|
@@ -236,20 +227,8 @@ The rule of thumb: if the parent task cannot be marked `done` without this work 
 | `done` | Completed |
 | `cancelled` | Will not be done |
 
-Set status explicitly with `tasks update --status <value>`. Acquiring a task sets it to `in_progress` automatically; no other transitions are enforced — use your judgment.
+Acquiring a task sets it to `in_progress` automatically. All other transitions are explicit via `tasks update --status`.
 
-## Task ID Format
+### Task ID format
 
-IDs look like `0003-fix-auth-bug`: a zero-padded 4-digit number followed by a kebab-case slug. Always use the full ID (number + slug) in commands. When creating with `--id`, supply only the slug — the number is assigned automatically.
-
-## Common Mistakes
-
-**Not releasing before marking done.** The lock and the status are independent. Always release the lock; otherwise the task shows as locked forever (until TTL expires).
-
-**Sharing a `TASK_HOLDER` across unrelated agents.** Each logical worker should have a distinct identity. Sharing means either agent can accidentally steal or release the other's locks.
-
-**Forgetting to renew long-running work.** Default TTL is 1 hour. If your sub-agent is doing slow work (large migrations, long builds), set a longer TTL at acquire time or renew periodically.
-
-**Acquiring without checking.** Run `tasks list --status open` first. If nothing is open, there is nothing to do. Do not busy-wait — check once and stop or wait for new tasks to appear.
-
-**Tagging follow-up tasks as children.** Only use `--parent` when the child must complete for the parent to be done. Discovered-but-not-blocking work should be created without a parent so it sits in the open backlog without polluting the parent's child list.
+IDs look like `0003-fix-auth-bug`: a zero-padded 4-digit number followed by a kebab-case slug. Always use the full ID in commands. When creating with `--id`, supply only the slug — the number is assigned automatically.

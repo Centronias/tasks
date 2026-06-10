@@ -61,8 +61,13 @@ enum Command {
     /// `open` status.
     Create {
         /// Short human-readable summary of the work to be done.
+        /// May be supplied as a bare positional argument or via `--title`.
+        #[arg(index = 1)]
+        title_pos: Option<String>,
+
+        /// Short human-readable summary of the work to be done (flag form).
         #[arg(long)]
-        title: String,
+        title: Option<String>,
 
         /// Optional longer description with additional context or acceptance criteria.
         #[arg(long)]
@@ -83,6 +88,10 @@ enum Command {
 
     /// List tasks, optionally filtered by status and/or parent.
     ///
+    /// By default shows only incomplete tasks (`open` and `in_progress`).
+    /// Pass `--all` to include every status, or `--status <s>` to narrow to
+    /// one specific status.
+    ///
     /// Outputs one task per line in the format:
     ///   `<id>  <status>  <title>  [locked]`
     /// Pass `--json` to get a machine-readable JSON array instead, which
@@ -97,6 +106,11 @@ enum Command {
         /// Use to check subtask progress without listing the entire backlog.
         #[arg(long)]
         parent: Option<String>,
+
+        /// Show all tasks regardless of status (overrides `--status`).
+        /// By default only `open` and `in_progress` tasks are shown.
+        #[arg(long)]
+        all: bool,
 
         /// Emit a JSON array instead of the default plain-text table.
         /// Each element includes all task fields plus `locked_by` and
@@ -217,6 +231,17 @@ enum Command {
         #[arg(long, default_value_t = 3600)]
         ttl: u64,
     },
+
+    /// Report key health metrics about the task database.
+    ///
+    /// Shows a status breakdown, completion rate, likely-abandoned task count,
+    /// stalled in-progress tasks (expired locks), and child-task usage.
+    /// Use `--json` for machine-readable output.
+    Stats {
+        /// Emit a JSON object instead of the default human-readable summary.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 fn parse_status(s: &str) -> Result<Status, String> {
@@ -272,11 +297,17 @@ fn main() -> anyhow::Result<()> {
         }
 
         Command::Create {
+            title_pos,
             title,
             description,
             id,
             parent,
         } => {
+            let title = title.or(title_pos).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "title is required: pass it as a positional argument or with --title"
+                )
+            })?;
             let slug = id.unwrap_or_else(|| db::slugify(&title));
             let full_id = db::create_task(
                 &conn,
@@ -291,36 +322,50 @@ fn main() -> anyhow::Result<()> {
         Command::List {
             status,
             parent,
+            all,
             json,
         } => {
-            let tasks = db::list_tasks(&conn, status.as_ref(), parent.as_deref())?;
+            let tasks = db::list_tasks(&conn, status.as_ref(), parent.as_deref(), all)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else {
+                use comfy_table::presets::UTF8_FULL_CONDENSED;
+                use comfy_table::{Cell, ContentArrangement, Table};
+                let mut table = Table::new();
+                table
+                    .load_preset(UTF8_FULL_CONDENSED)
+                    .set_content_arrangement(ContentArrangement::Dynamic)
+                    .set_header(vec!["ID", "STATUS", "TITLE", "LOCKED"]);
                 for task in &tasks {
                     let lock_marker = if task.locked_by.is_some() {
-                        " [locked]"
+                        "\u{1f512}"
                     } else {
                         ""
                     };
-                    println!(
-                        "{:12}  {:12}  {}{}",
-                        task.id, task.status, task.title, lock_marker
-                    );
+                    table.add_row(vec![
+                        Cell::new(&task.id),
+                        Cell::new(&task.status),
+                        Cell::new(&task.title),
+                        Cell::new(lock_marker),
+                    ]);
                 }
+                println!("{table}");
             }
         }
 
-        Command::Show { id, json } => match db::get_task(&conn, &id)? {
-            None => anyhow::bail!("task not found: {id}"),
-            Some(task) => {
-                if json {
-                    println!("{}", serde_json::to_string_pretty(&task)?);
-                } else {
-                    print_task_human(&task);
+        Command::Show { id, json } => {
+            let id = db::resolve_id(&conn, &id)?;
+            match db::get_task(&conn, &id)? {
+                None => anyhow::bail!("task not found: {id}"),
+                Some(task) => {
+                    if json {
+                        println!("{}", serde_json::to_string_pretty(&task)?);
+                    } else {
+                        print_task_human(&task);
+                    }
                 }
             }
-        },
+        }
 
         Command::Update {
             id,
@@ -331,6 +376,7 @@ fn main() -> anyhow::Result<()> {
             if title.is_none() && description.is_none() && status.is_none() {
                 anyhow::bail!("at least one of --title, --description, --status is required");
             }
+            let id = db::resolve_id(&conn, &id)?;
             let found = db::update_task(
                 &conn,
                 &id,
@@ -345,6 +391,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Command::Delete { id, force } => {
+            let id = db::resolve_id(&conn, &id)?;
             let found = db::delete_task(&conn, &id, force)?;
             if !found {
                 anyhow::bail!("task not found: {id}");
@@ -353,12 +400,14 @@ fn main() -> anyhow::Result<()> {
         }
 
         Command::Acquire { id, holder, ttl } => {
+            let id = db::resolve_id(&conn, &id)?;
             let holder = resolve_holder(holder)?;
             db::acquire_task(&conn, &id, &holder, ttl)?;
             println!("acquired {id} by {holder}");
         }
 
         Command::Release { id, holder, force } => {
+            let id = db::resolve_id(&conn, &id)?;
             let found = if force {
                 db::release_task(&conn, &id, "", true)?
             } else {
@@ -372,9 +421,32 @@ fn main() -> anyhow::Result<()> {
         }
 
         Command::Renew { id, holder, ttl } => {
+            let id = db::resolve_id(&conn, &id)?;
             let holder = resolve_holder(holder)?;
             db::renew_task(&conn, &id, &holder, ttl)?;
             println!("renewed {id} for {ttl}s");
+        }
+
+        Command::Stats { json } => {
+            let s = db::stats(&conn)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&s)?);
+            } else {
+                println!("total:            {}", s.total);
+                println!("  open:           {}", s.open);
+                println!("  in_progress:    {}", s.in_progress);
+                println!("  done:           {}", s.done);
+                println!("  cancelled:      {}", s.cancelled);
+                if let Some(pct) = s.completion_pct {
+                    println!("completion:       {pct:.1}%");
+                } else {
+                    println!("completion:       n/a");
+                }
+                println!("likely_abandoned: {}", s.likely_abandoned);
+                println!("stalled:          {}", s.stalled);
+                println!("child_tasks:      {}", s.child_tasks);
+                println!("parent_tasks:     {}", s.parent_tasks);
+            }
         }
     }
 
