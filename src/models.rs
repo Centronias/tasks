@@ -3,6 +3,16 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SortBy {
+    #[default]
+    Num, // ORDER BY t.num ASC
+    Updated, // ORDER BY t.updated_at DESC
+    Created, // ORDER BY t.created_at DESC
+    Status,  // ORDER BY t.status, t.num ASC
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "snake_case")]
 pub enum Status {

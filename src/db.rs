@@ -1,6 +1,6 @@
 use std::str::FromStr;
 
-use crate::models::{Lock, Status, Task, TaskStats};
+use crate::models::{Lock, SortBy, Status, Task, TaskStats};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OptionalExtension, params};
 
@@ -134,6 +134,40 @@ pub fn create_task(
     Ok(full_id)
 }
 
+pub fn import_task(conn: &Connection, task: &Task) -> rusqlite::Result<bool> {
+    let created_at = task.created_at.to_rfc3339();
+    let updated_at = task.updated_at.to_rfc3339();
+    let status = task.status.to_string();
+    conn.execute(
+        "INSERT OR IGNORE INTO tasks (id, num, title, description, status, created_at, updated_at, parent_id, summary)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            task.id,
+            task.num,
+            task.title,
+            task.description,
+            status,
+            created_at,
+            updated_at,
+            task.parent_id,
+            task.summary,
+        ],
+    )?;
+    let inserted = conn.changes() > 0;
+    if inserted {
+        if let (Some(holder), Some(expires)) = (&task.locked_by, &task.lock_expires) {
+            let now = Utc::now().to_rfc3339();
+            let expires_str = expires.to_rfc3339();
+            conn.execute(
+                "INSERT OR IGNORE INTO locks (task_id, holder, acquired_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
+                params![task.id, holder, now, expires_str],
+            )?;
+        }
+        log_event(conn, &task.id, "imported", None)?;
+    }
+    Ok(inserted)
+}
+
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
     let status_str: String = row.get(4)?;
     let status = Status::from_str(&status_str).map_err(|e| {
@@ -184,12 +218,20 @@ pub fn list_tasks(
     show_all: bool,
     limit: Option<i64>,
     offset: Option<i64>,
+    sort: SortBy,
 ) -> rusqlite::Result<Vec<Task>> {
     let now = Utc::now().to_rfc3339();
+    let order_by = match sort {
+        SortBy::Num => "t.num ASC",
+        SortBy::Updated => "t.updated_at DESC",
+        SortBy::Created => "t.created_at DESC",
+        SortBy::Status => "t.status, t.num ASC",
+    };
     // When show_all is true  → no status restriction.
     // When status_filter is Some(s) → restrict to that exact status.
     // Otherwise (default)   → show only open and in_progress tasks.
-    let sql = "SELECT t.id, t.num, t.title, t.description, t.status,
+    let sql = format!(
+        "SELECT t.id, t.num, t.title, t.description, t.status,
                       t.created_at, t.updated_at,
                       CASE WHEN l.expires_at > ?1 THEN l.holder END,
                       CASE WHEN l.expires_at > ?1 THEN l.expires_at END,
@@ -202,13 +244,14 @@ pub fn list_tasks(
                    OR (?2 IS NULL AND t.status IN ('open', 'in_progress'))
                )
                  AND (?3 IS NULL OR t.parent_id = ?3)
-               ORDER BY t.num ASC
-               LIMIT ?5 OFFSET ?6";
+               ORDER BY {order_by}
+               LIMIT ?5 OFFSET ?6"
+    );
     let status_val = status_filter.map(ToString::to_string);
     let show_all_int: i32 = i32::from(show_all);
     let limit_val = limit.unwrap_or(-1);
     let offset_val = offset.unwrap_or(0);
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![
             now,
@@ -230,10 +273,18 @@ pub fn search_tasks(
     parent_filter: Option<&str>,
     limit: Option<i64>,
     offset: Option<i64>,
+    sort: SortBy,
 ) -> rusqlite::Result<Vec<Task>> {
     let now = Utc::now().to_rfc3339();
     let pattern = format!("%{query}%");
-    let sql = "SELECT t.id, t.num, t.title, t.description, t.status,
+    let order_by = match sort {
+        SortBy::Num => "t.num ASC",
+        SortBy::Updated => "t.updated_at DESC",
+        SortBy::Created => "t.created_at DESC",
+        SortBy::Status => "t.status, t.num ASC",
+    };
+    let sql = format!(
+        "SELECT t.id, t.num, t.title, t.description, t.status,
                       t.created_at, t.updated_at,
                       CASE WHEN l.expires_at > ?1 THEN l.holder END,
                       CASE WHEN l.expires_at > ?1 THEN l.expires_at END,
@@ -243,12 +294,13 @@ pub fn search_tasks(
                WHERE (t.title LIKE ?2 OR t.description LIKE ?2 OR t.summary LIKE ?2)
                  AND (?3 IS NULL OR t.status = ?3)
                  AND (?4 IS NULL OR t.parent_id = ?4)
-               ORDER BY t.num ASC
-               LIMIT ?5 OFFSET ?6";
+               ORDER BY {order_by}
+               LIMIT ?5 OFFSET ?6"
+    );
     let status_val = status_filter.map(ToString::to_string);
     let limit_val = limit.unwrap_or(-1);
     let offset_val = offset.unwrap_or(0);
-    let mut stmt = conn.prepare(sql)?;
+    let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
         params![
             now,
@@ -669,10 +721,11 @@ pub fn stats(conn: &Connection) -> anyhow::Result<TaskStats> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_task, create_task, delete_task, gc_tasks, get_task, list_tasks, migrate, next_task,
-        release_task, renew_task, resolve_id, search_tasks, slugify, update_task,
+        acquire_task, create_task, delete_task, gc_tasks, get_task, import_task, list_tasks,
+        migrate, next_task, release_task, renew_task, resolve_id, search_tasks, slugify,
+        update_task,
     };
-    use crate::models::Status;
+    use crate::models::{SortBy, Status};
     use chrono::Utc;
     use rstest::{fixture, rstest};
     use rusqlite::Connection;
@@ -800,7 +853,7 @@ mod tests {
     #[rstest]
     fn list_empty(conn: Connection) {
         assert!(
-            list_tasks(&conn, None, None, false, None, None)
+            list_tasks(&conn, None, None, false, None, None, SortBy::Num)
                 .unwrap()
                 .is_empty()
         );
@@ -811,7 +864,7 @@ mod tests {
         create_task(&conn, "a", "A", None, None).unwrap();
         create_task(&conn, "b", "B", None, None).unwrap();
         create_task(&conn, "c", "C", None, None).unwrap();
-        let tasks = list_tasks(&conn, None, None, false, None, None).unwrap();
+        let tasks = list_tasks(&conn, None, None, false, None, None, SortBy::Num).unwrap();
         assert_eq!(tasks.len(), 3);
         assert!(tasks[0].num < tasks[1].num);
         assert!(tasks[1].num < tasks[2].num);
@@ -832,7 +885,7 @@ mod tests {
         update_task(&conn, &id3, None, None, Some(&Status::Done), None).unwrap();
         update_task(&conn, &id4, None, None, Some(&Status::Cancelled), None).unwrap();
 
-        let tasks = list_tasks(&conn, Some(&filter), None, false, None, None).unwrap();
+        let tasks = list_tasks(&conn, Some(&filter), None, false, None, None, SortBy::Num).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, filter);
     }
@@ -845,7 +898,16 @@ mod tests {
         let c2 = create_task(&conn, "child-2", "Child 2", None, Some(parent.as_str())).unwrap();
         create_task(&conn, "unrelated", "Unrelated", None, Some(other.as_str())).unwrap();
 
-        let children = list_tasks(&conn, None, Some(parent.as_str()), false, None, None).unwrap();
+        let children = list_tasks(
+            &conn,
+            None,
+            Some(parent.as_str()),
+            false,
+            None,
+            None,
+            SortBy::Num,
+        )
+        .unwrap();
         assert_eq!(children.len(), 2);
         assert!(children.iter().any(|t| t.id == c1));
         assert!(children.iter().any(|t| t.id == c2));
@@ -1095,7 +1157,7 @@ mod tests {
         create_task(&conn, "fix-login", "Fix Login Bug", None, None).unwrap();
         create_task(&conn, "add-feature", "Add Feature", None, None).unwrap();
 
-        let results = search_tasks(&conn, "Login", None, None, None, None).unwrap();
+        let results = search_tasks(&conn, "Login", None, None, None, None, SortBy::Num).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Fix Login Bug");
     }
@@ -1112,7 +1174,8 @@ mod tests {
         .unwrap();
         create_task(&conn, "task-b", "Task B", Some("something else"), None).unwrap();
 
-        let results = search_tasks(&conn, "unique_keyword", None, None, None, None).unwrap();
+        let results =
+            search_tasks(&conn, "unique_keyword", None, None, None, None, SortBy::Num).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Task A");
     }
@@ -1121,7 +1184,8 @@ mod tests {
     fn search_no_match_returns_empty(conn: Connection) {
         create_task(&conn, "task-a", "Task A", Some("description A"), None).unwrap();
 
-        let results = search_tasks(&conn, "xyzzy_no_match", None, None, None, None).unwrap();
+        let results =
+            search_tasks(&conn, "xyzzy_no_match", None, None, None, None, SortBy::Num).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1139,7 +1203,8 @@ mod tests {
         .unwrap();
         create_task(&conn, "task-b", "Task B", None, None).unwrap();
 
-        let results = search_tasks(&conn, "approach_xyz", None, None, None, None).unwrap();
+        let results =
+            search_tasks(&conn, "approach_xyz", None, None, None, None, SortBy::Num).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
     }
@@ -1150,13 +1215,29 @@ mod tests {
         let id2 = create_task(&conn, "task-b", "Alpha Done", None, None).unwrap();
         update_task(&conn, &id2, None, None, Some(&Status::Done), None).unwrap();
 
-        let open_results =
-            search_tasks(&conn, "Alpha", Some(&Status::Open), None, None, None).unwrap();
+        let open_results = search_tasks(
+            &conn,
+            "Alpha",
+            Some(&Status::Open),
+            None,
+            None,
+            None,
+            SortBy::Num,
+        )
+        .unwrap();
         assert_eq!(open_results.len(), 1);
         assert_eq!(open_results[0].id, id1);
 
-        let done_results =
-            search_tasks(&conn, "Alpha", Some(&Status::Done), None, None, None).unwrap();
+        let done_results = search_tasks(
+            &conn,
+            "Alpha",
+            Some(&Status::Done),
+            None,
+            None,
+            None,
+            SortBy::Num,
+        )
+        .unwrap();
         assert_eq!(done_results.len(), 1);
         assert_eq!(done_results[0].id, id2);
     }
@@ -1175,8 +1256,16 @@ mod tests {
         )
         .unwrap();
 
-        let results =
-            search_tasks(&conn, "Alpha", None, Some(parent.as_str()), None, None).unwrap();
+        let results = search_tasks(
+            &conn,
+            "Alpha",
+            None,
+            Some(parent.as_str()),
+            None,
+            None,
+            SortBy::Num,
+        )
+        .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, c1);
     }
@@ -1290,5 +1379,47 @@ mod tests {
         assert!(gc_tasks(&conn, false).unwrap().is_empty());
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.status, Status::InProgress);
+    }
+
+    // ── import_task ───────────────────────────────────────────────────────────
+
+    #[rstest]
+    fn import_skips_duplicate(conn: Connection) {
+        // Build a fresh Task value not yet in the database.
+        let now = Utc::now();
+        let task = crate::models::Task {
+            id: "0042-import-me".to_string(),
+            num: 42,
+            title: "Import Me".to_string(),
+            description: None,
+            summary: None,
+            status: Status::Open,
+            created_at: now,
+            updated_at: now,
+            locked_by: None,
+            lock_expires: None,
+            parent_id: None,
+        };
+
+        // First call: row is new — should be inserted.
+        let first = import_task(&conn, &task).unwrap();
+        assert!(first, "first import_task call should return true (new row)");
+
+        // Second call: same id — should be skipped.
+        let second = import_task(&conn, &task).unwrap();
+        assert!(
+            !second,
+            "second import_task call should return false (duplicate)"
+        );
+
+        // Row count must still be exactly 1.
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tasks WHERE id = ?1",
+                ["0042-import-me"],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "row count should remain 1 after duplicate import");
     }
 }

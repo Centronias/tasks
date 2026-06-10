@@ -27,7 +27,7 @@ mod db;
 mod models;
 
 use clap::{CommandFactory, Parser, Subcommand};
-use models::Status;
+use models::{SortBy, Status};
 
 /// CLI for managing tasks handed off to LLM agents.
 ///
@@ -138,6 +138,11 @@ enum Command {
         /// Number of tasks to skip before returning results.
         #[arg(long)]
         offset: Option<i64>,
+
+        /// Sort order for results.
+        /// Accepted values: `num` (default), `updated`, `created`, `status`.
+        #[arg(long, default_value = "num")]
+        sort: SortBy,
     },
 
     /// Show full details for a single task.
@@ -309,6 +314,11 @@ enum Command {
         /// Number of tasks to skip before returning results.
         #[arg(long)]
         offset: Option<i64>,
+
+        /// Sort order for results.
+        /// Accepted values: `num` (default), `updated`, `created`, `status`.
+        #[arg(long, default_value = "num")]
+        sort: SortBy,
     },
 
     /// Complete a task in one step: optionally set summary, release the lock, and mark done.
@@ -549,13 +559,15 @@ fn main() -> anyhow::Result<()> {
             tree,
             limit,
             offset,
+            sort,
         } => {
             if tree && json {
                 anyhow::bail!("--tree and --json cannot be used together");
             }
             if tree {
                 // Fetch all tasks (ignoring parent filter for tree — we show the whole tree)
-                let tasks = db::list_tasks(&conn, status.as_ref(), None, true, None, None)?;
+                let tasks =
+                    db::list_tasks(&conn, status.as_ref(), None, true, None, None, SortBy::Num)?;
                 print_tree(&tasks, parent.as_deref());
             } else {
                 let tasks = db::list_tasks(
@@ -565,6 +577,7 @@ fn main() -> anyhow::Result<()> {
                     all,
                     limit,
                     offset,
+                    sort,
                 )?;
                 if json {
                     println!("{}", serde_json::to_string_pretty(&tasks)?);
@@ -699,6 +712,7 @@ fn main() -> anyhow::Result<()> {
             json,
             limit,
             offset,
+            sort,
         } => {
             let tasks = db::search_tasks(
                 &conn,
@@ -707,6 +721,7 @@ fn main() -> anyhow::Result<()> {
                 parent.as_deref(),
                 limit,
                 offset,
+                sort,
             )?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
@@ -794,7 +809,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Command::Export { all, output } => {
-            let tasks = db::list_tasks(&conn, None, None, all, None, None)?;
+            let tasks = db::list_tasks(&conn, None, None, all, None, None, SortBy::Num)?;
             let json = serde_json::to_string_pretty(&tasks)?;
             match output {
                 Some(path) => std::fs::write(&path, &json)
@@ -819,20 +834,20 @@ fn main() -> anyhow::Result<()> {
                 }
                 println!("would import {count} tasks");
             } else {
+                let mut imported = 0usize;
+                let mut skipped = 0usize;
                 for task in &tasks {
-                    let slug = db::slugify(&task.title);
-                    let new_id = db::create_task(
-                        &conn,
-                        &slug,
-                        &task.title,
-                        task.description.as_deref(),
-                        task.parent_id.as_deref(),
-                    )?;
-                    if let Some(s) = &task.summary {
-                        db::update_task(&conn, &new_id, None, None, None, Some(s.as_str()))?;
+                    if db::import_task(&conn, task)? {
+                        imported += 1;
+                    } else {
+                        skipped += 1;
                     }
                 }
-                println!("imported {count} tasks");
+                if skipped > 0 {
+                    println!("imported {imported}, skipped {skipped} (already exist)");
+                } else {
+                    println!("imported {imported}");
+                }
             }
         }
 
