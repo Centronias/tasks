@@ -39,7 +39,7 @@ use std::str::FromStr;
 /// a task you supply only the slug portion via `--id`; the numeric prefix is
 /// assigned automatically.
 #[derive(Parser)]
-#[command(name = "task", about = "Manage tasks for LLM agents")]
+#[command(name = "task", about = "Manage tasks for LLM agents", version = env!("CARGO_PKG_VERSION"))]
 struct Cli {
     #[command(subcommand)]
     command: Command,

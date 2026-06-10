@@ -42,7 +42,7 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn slugify(title: &str) -> String {
-    title
+    let slug = title
         .to_lowercase()
         .chars()
         .map(|c| if c.is_alphanumeric() { c } else { '-' })
@@ -50,7 +50,26 @@ pub fn slugify(title: &str) -> String {
         .split('-')
         .filter(|s| !s.is_empty())
         .collect::<Vec<_>>()
-        .join("-")
+        .join("-");
+
+    if slug.len() <= 40 {
+        return slug;
+    }
+
+    // The slug is ASCII-only (all chars are alphanumeric ASCII or '-'), so byte
+    // indexing is safe and equivalent to char indexing.
+    if slug.as_bytes()[40] == b'-' {
+        // Cut lands exactly at a word boundary — keep all 40 chars.
+        slug[..40].to_string()
+    } else {
+        // Cut lands mid-word — back up to the last hyphen.
+        match slug[..40].rfind('-') {
+            Some(pos) => slug[..pos].to_string(),
+            // Single word longer than 40 chars: hard-truncate with no hyphen to
+            // back up to.
+            None => slug[..40].to_string(),
+        }
+    }
 }
 
 pub fn create_task(
@@ -347,6 +366,26 @@ mod tests {
     #[case("already-a-slug", "already-a-slug")]
     #[case("123 task", "123-task")]
     #[case("!!!", "")]
+    // truncation: mid-word cut backs up to last hyphen (result < 40 chars)
+    #[case(
+        "this is a very long title that exceeds the maximum allowed slug length",
+        "this-is-a-very-long-title-that-exceeds"
+    )]
+    // truncation: cut lands exactly at a word boundary (char 40 is '-'), keep 40
+    #[case(
+        "aaaaaaaaaa bbbbbbbbbb cccccccccc ddddddd extra",
+        "aaaaaaaaaa-bbbbbbbbbb-cccccccccc-ddddddd"
+    )]
+    // no truncation: slug is exactly 40 chars
+    #[case(
+        "aaaaaaaaaa bbbbbbbbbb cccccccccc ddddddd",
+        "aaaaaaaaaa-bbbbbbbbbb-cccccccccc-ddddddd"
+    )]
+    // truncation: single word > 40 chars — hard cut at 40
+    #[case(
+        "supercalifragilisticexpialidocioussupercalifragilisticexpialidocious",
+        "supercalifragilisticexpialidocioussuperc"
+    )]
     fn test_slugify(#[case] input: &str, #[case] expected: &str) {
         assert_eq!(slugify(input), expected);
     }

@@ -1,6 +1,16 @@
 # Task CLI — Agent Guide
 
-This guide is written for LLM agents that use the `task` CLI to coordinate work, including delegating to sub-agents.
+This guide is written for LLM agents that use the `tasks` CLI to coordinate work, including delegating to sub-agents.
+
+## Prerequisites
+
+`tasks` must be installed as a global CLI tool and available on your `PATH`. Verify with:
+
+```
+tasks --help
+```
+
+If the command is not found, ask a human to install it — **do not use a local development copy** (e.g. `./target/release/tasks` or `cargo run`). Local builds may be out of date, differ in behavior, or write to a different database than the one other agents are using.
 
 ## Identity
 
@@ -17,7 +27,7 @@ All lock operations (`acquire`, `release`, `renew`) use this identity. Pick some
 Run this once before anything else. It is safe to run repeatedly:
 
 ```
-task migrate
+tasks migrate
 ```
 
 ## Task Sizing
@@ -37,19 +47,19 @@ A useful heuristic: if writing the `--description` for a task requires more than
 ### Pick up a task
 
 ```
-task list --status open
+tasks list --status open
 ```
 
 Pick one, then acquire it. Acquiring sets the status to `in_progress` and places a lock so other agents leave it alone:
 
 ```
-task acquire 0003-fix-auth-bug
+tasks acquire 0003-fix-auth-bug
 ```
 
 The default lock TTL is 3600 seconds. If your work will take longer, set a longer TTL:
 
 ```
-task acquire 0003-fix-auth-bug --ttl 7200
+tasks acquire 0003-fix-auth-bug --ttl 7200
 ```
 
 ### Renew a lock you already hold
@@ -57,7 +67,7 @@ task acquire 0003-fix-auth-bug --ttl 7200
 If your work is taking longer than expected, renew before the lock expires. The new TTL starts from now:
 
 ```
-task renew 0003-fix-auth-bug --ttl 3600
+tasks renew 0003-fix-auth-bug --ttl 3600
 ```
 
 ### Finish a task
@@ -65,16 +75,16 @@ task renew 0003-fix-auth-bug --ttl 3600
 Release the lock and update the status in any order. Both steps are required — `release` alone does not change status:
 
 ```
-task release 0003-fix-auth-bug
-task update  0003-fix-auth-bug --status done
+tasks release 0003-fix-auth-bug
+tasks update  0003-fix-auth-bug --status done
 ```
 
 If you want to leave a note about what was done, update the description before releasing:
 
 ```
-task update 0003-fix-auth-bug --description "Fixed by patching the JWT expiry check in auth.rs"
-task release 0003-fix-auth-bug
-task update  0003-fix-auth-bug --status done
+tasks update 0003-fix-auth-bug --description "Fixed by patching the JWT expiry check in auth.rs"
+tasks release 0003-fix-auth-bug
+tasks update  0003-fix-auth-bug --status done
 ```
 
 ### Abandon a task (return it to the queue)
@@ -82,8 +92,8 @@ task update  0003-fix-auth-bug --status done
 Release the lock and reset to open so another agent can pick it up:
 
 ```
-task release 0003-fix-auth-bug
-task update  0003-fix-auth-bug --status open
+tasks release 0003-fix-auth-bug
+tasks update  0003-fix-auth-bug --status open
 ```
 
 ## Decomposing a Task into Children
@@ -95,15 +105,15 @@ Use child tasks when a task is too large to complete in one session, or when dis
 Before acquiring the parent, create all the children you can identify:
 
 ```
-task create --title "Write migration for users table" \
+tasks create --title "Write migration for users table" \
             --description "Add columns: display_name (TEXT), verified_at (TEXT nullable)." \
             --parent 0005-migrate-schema
 
-task create --title "Write migration for products table" \
+tasks create --title "Write migration for products table" \
             --description "Add column: archived_at (TEXT nullable)." \
             --parent 0005-migrate-schema
 
-task create --title "Write migration for orders table" \
+tasks create --title "Write migration for orders table" \
             --description "Add FK orders.user_id REFERENCES users(id)." \
             --parent 0005-migrate-schema
 ```
@@ -111,7 +121,7 @@ task create --title "Write migration for orders table" \
 Then acquire the parent as a coordination task:
 
 ```
-task acquire 0005-migrate-schema
+tasks acquire 0005-migrate-schema
 ```
 
 Your role as coordinator is to spawn sub-agents for each child, monitor progress, and close out the parent when all children are done.
@@ -121,9 +131,9 @@ Your role as coordinator is to spawn sub-agents for each child, monitor progress
 To see the status of all subtasks for a parent:
 
 ```
-task list --parent 0005-migrate-schema
-task list --parent 0005-migrate-schema --status open
-task list --parent 0005-migrate-schema --json
+tasks list --parent 0005-migrate-schema
+tasks list --parent 0005-migrate-schema --status open
+tasks list --parent 0005-migrate-schema --json
 ```
 
 ### Closing out the parent
@@ -131,15 +141,15 @@ task list --parent 0005-migrate-schema --json
 Before marking the parent done, verify no children are still outstanding:
 
 ```
-task list --parent 0005-migrate-schema --status open
-task list --parent 0005-migrate-schema --status in_progress
+tasks list --parent 0005-migrate-schema --status open
+tasks list --parent 0005-migrate-schema --status in_progress
 ```
 
 If both return empty, release and close the parent:
 
 ```
-task release 0005-migrate-schema
-task update  0005-migrate-schema --status done
+tasks release 0005-migrate-schema
+tasks update  0005-migrate-schema --status done
 ```
 
 ## Delegating to Sub-Agents
@@ -149,7 +159,7 @@ task update  0005-migrate-schema --status done
 Create a task for each unit of work you want to delegate. Use `--description` to give the sub-agent full context — it is the primary briefing document:
 
 ```
-task create --title "Add rate limiting to /api/login" \
+tasks create --title "Add rate limiting to /api/login" \
             --description "Use a sliding-window counter in Redis. Max 10 attempts per IP per minute. Return 429 with Retry-After header. Tests required."
 ```
 
@@ -160,21 +170,21 @@ The command prints the full ID (e.g. `0007-add-rate-limiting-to-api-login`). Pas
 Tell the sub-agent its identity, the task ID, and that it should acquire before starting:
 
 ```
-TASK_HOLDER=subagent-ratelimit task acquire 0007-add-rate-limiting-to-api-login
+TASK_HOLDER=subagent-ratelimit tasks acquire 0007-add-rate-limiting-to-api-login
 ```
 
-Or instruct the sub-agent to set its own `TASK_HOLDER` and call `task acquire` itself.
+Or instruct the sub-agent to set its own `TASK_HOLDER` and call `tasks acquire` itself.
 
 ### Monitoring sub-agent progress
 
 ```
-task list --status in_progress --json
+tasks list --status in_progress --json
 ```
 
 The JSON output includes `locked_by` and `lock_expires` so you can see which agent holds each task and when the lock expires.
 
 ```
-task show 0007-add-rate-limiting-to-api-login
+tasks show 0007-add-rate-limiting-to-api-login
 ```
 
 ### Recovering a stalled sub-agent
@@ -182,8 +192,8 @@ task show 0007-add-rate-limiting-to-api-login
 If a sub-agent's lock has expired (visible in `lock_expires`) or the agent is known to be dead, force-release the lock and reassign:
 
 ```
-task release 0007-add-rate-limiting-to-api-login --force
-task acquire 0007-add-rate-limiting-to-api-login --holder replacement-agent
+tasks release 0007-add-rate-limiting-to-api-login --force
+tasks acquire 0007-add-rate-limiting-to-api-login --holder replacement-agent
 ```
 
 `--force` on release bypasses the holder check so you do not need to impersonate the stalled agent.
@@ -193,9 +203,9 @@ task acquire 0007-add-rate-limiting-to-api-login --holder replacement-agent
 Create all tasks first, then have sub-agents acquire and work on them concurrently. Each `acquire` is atomic — only one agent will succeed per task:
 
 ```
-task create --title "Migrate users table"    --description "..."  # prints 0008-migrate-users-table
-task create --title "Migrate products table" --description "..."  # prints 0009-migrate-products-table
-task create --title "Migrate orders table"   --description "..."  # prints 0010-migrate-orders-table
+tasks create --title "Migrate users table"    --description "..."  # prints 0008-migrate-users-table
+tasks create --title "Migrate products table" --description "..."  # prints 0009-migrate-products-table
+tasks create --title "Migrate orders table"   --description "..."  # prints 0010-migrate-orders-table
 
 # Launch three sub-agents, each targeting one task ID
 ```
@@ -209,11 +219,11 @@ A follow-up task is work discovered during the execution of another task — a b
 Create follow-up tasks immediately when you discover them, before you forget:
 
 ```
-task create --title "Add index on users.email" \
+tasks create --title "Add index on users.email" \
             --description "Discovered during the users migration — full-table scans on login are now visible in EXPLAIN."
 ```
 
-Do not add a `--parent` flag. The relationship here is temporal (discovered while doing X), not structural (required to complete X). Mixing the two makes `task list --parent` unreliable as a completion-gating tool.
+Do not add a `--parent` flag. The relationship here is temporal (discovered while doing X), not structural (required to complete X). Mixing the two makes `tasks list --parent` unreliable as a completion-gating tool.
 
 The rule of thumb: if the parent task cannot be marked `done` without this work finishing, it is a child task. If the parent can finish regardless, it is a follow-up.
 
@@ -226,7 +236,7 @@ The rule of thumb: if the parent task cannot be marked `done` without this work 
 | `done` | Completed |
 | `cancelled` | Will not be done |
 
-Set status explicitly with `task update --status <value>`. Acquiring a task sets it to `in_progress` automatically; no other transitions are enforced — use your judgment.
+Set status explicitly with `tasks update --status <value>`. Acquiring a task sets it to `in_progress` automatically; no other transitions are enforced — use your judgment.
 
 ## Task ID Format
 
@@ -240,6 +250,6 @@ IDs look like `0003-fix-auth-bug`: a zero-padded 4-digit number followed by a ke
 
 **Forgetting to renew long-running work.** Default TTL is 1 hour. If your sub-agent is doing slow work (large migrations, long builds), set a longer TTL at acquire time or renew periodically.
 
-**Acquiring without checking.** Run `task list --status open` first. If nothing is open, there is nothing to do. Do not busy-wait — check once and stop or wait for new tasks to appear.
+**Acquiring without checking.** Run `tasks list --status open` first. If nothing is open, there is nothing to do. Do not busy-wait — check once and stop or wait for new tasks to appear.
 
 **Tagging follow-up tasks as children.** Only use `--parent` when the child must complete for the parent to be done. Discovered-but-not-blocking work should be created without a parent so it sits in the open backlog without polluting the parent's child list.
