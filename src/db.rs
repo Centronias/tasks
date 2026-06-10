@@ -146,42 +146,6 @@ pub fn create_task(
     Ok(full_id)
 }
 
-pub fn import_task(conn: &Connection, task: &Task) -> rusqlite::Result<bool> {
-    let created_at = task.created_at.to_rfc3339();
-    let updated_at = task.updated_at.to_rfc3339();
-    let status = task.status.to_string();
-    let priority = task.priority.to_string();
-    conn.execute(
-        "INSERT OR IGNORE INTO tasks (id, num, title, description, status, created_at, updated_at, parent_id, summary, priority)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![
-            task.id,
-            task.num,
-            task.title,
-            task.description,
-            status,
-            created_at,
-            updated_at,
-            task.parent_id,
-            task.summary,
-            priority,
-        ],
-    )?;
-    let inserted = conn.changes() > 0;
-    if inserted {
-        if let (Some(holder), Some(expires)) = (&task.locked_by, &task.lock_expires) {
-            let now = Utc::now().to_rfc3339();
-            let expires_str = expires.to_rfc3339();
-            conn.execute(
-                "INSERT OR IGNORE INTO locks (task_id, holder, acquired_at, expires_at) VALUES (?1, ?2, ?3, ?4)",
-                params![task.id, holder, now, expires_str],
-            )?;
-        }
-        log_event(conn, &task.id, "imported", None)?;
-    }
-    Ok(inserted)
-}
-
 fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
     let status_str: String = row.get(4)?;
     let status = Status::from_str(&status_str).map_err(|e| {
@@ -230,14 +194,11 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
     })
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn list_tasks(
     conn: &Connection,
     status_filter: Option<&Status>,
     parent_filter: Option<&str>,
     show_all: bool,
-    limit: Option<i64>,
-    offset: Option<i64>,
     sort: SortBy,
     priority_filter: Option<&Priority>,
 ) -> rusqlite::Result<Vec<Task>> {
@@ -266,38 +227,24 @@ pub fn list_tasks(
                )
                  AND (?3 IS NULL OR t.parent_id = ?3)
                  AND (?5 IS NULL OR t.priority = ?5)
-               ORDER BY {order_by}
-               LIMIT ?6 OFFSET ?7"
+               ORDER BY {order_by}"
     );
     let status_val = status_filter.map(ToString::to_string);
     let priority_val = priority_filter.map(ToString::to_string);
     let show_all_int: i32 = i32::from(show_all);
-    let limit_val = limit.unwrap_or(-1);
-    let offset_val = offset.unwrap_or(0);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        params![
-            now,
-            status_val,
-            parent_filter,
-            show_all_int,
-            priority_val,
-            limit_val,
-            offset_val
-        ],
+        params![now, status_val, parent_filter, show_all_int, priority_val],
         row_to_task,
     )?;
     rows.collect()
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn search_tasks(
     conn: &Connection,
     query: &str,
     status_filter: Option<&Status>,
     parent_filter: Option<&str>,
-    limit: Option<i64>,
-    offset: Option<i64>,
     sort: SortBy,
     priority_filter: Option<&Priority>,
 ) -> rusqlite::Result<Vec<Task>> {
@@ -321,24 +268,13 @@ pub fn search_tasks(
                  AND (?3 IS NULL OR t.status = ?3)
                  AND (?4 IS NULL OR t.parent_id = ?4)
                  AND (?5 IS NULL OR t.priority = ?5)
-               ORDER BY {order_by}
-               LIMIT ?6 OFFSET ?7"
+               ORDER BY {order_by}"
     );
     let status_val = status_filter.map(ToString::to_string);
     let priority_val = priority_filter.map(ToString::to_string);
-    let limit_val = limit.unwrap_or(-1);
-    let offset_val = offset.unwrap_or(0);
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(
-        params![
-            now,
-            pattern,
-            status_val,
-            parent_filter,
-            priority_val,
-            limit_val,
-            offset_val
-        ],
+        params![now, pattern, status_val, parent_filter, priority_val],
         row_to_task,
     )?;
     rows.collect()
@@ -513,69 +449,6 @@ pub fn acquire_task(conn: &Connection, id: &str, holder: &str, ttl: u64) -> anyh
     )?;
     log_event(conn, id, "acquired", Some(holder))?;
     Ok(())
-}
-
-/// Atomically find the first open task, acquire it, and return it.
-///
-/// Wraps the SELECT → INSERT lock → UPDATE status sequence in a single
-/// BEGIN IMMEDIATE / COMMIT block so no two callers can grab the same task.
-pub fn next_task(
-    conn: &Connection,
-    holder: &str,
-    ttl_secs: i64,
-    parent_filter: Option<&str>,
-) -> rusqlite::Result<Option<Task>> {
-    let now = Utc::now();
-    let now_str = now.to_rfc3339();
-    let expires_str = (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339();
-
-    conn.execute_batch("BEGIN IMMEDIATE")?;
-
-    let result = (|| -> rusqlite::Result<Option<String>> {
-        let task_id: Option<String> = conn
-            .query_row(
-                "SELECT id FROM tasks
-                 WHERE status = 'open'
-                   AND (?1 IS NULL OR parent_id = ?1)
-                 ORDER BY CASE priority WHEN 'critical' THEN 0 WHEN 'high' THEN 1 WHEN 'medium' THEN 2 WHEN 'low' THEN 3 ELSE 4 END ASC, num ASC
-                 LIMIT 1",
-                params![parent_filter],
-                |r| r.get(0),
-            )
-            .optional()?;
-
-        let Some(id) = task_id else { return Ok(None) };
-
-        conn.execute(
-            "INSERT OR REPLACE INTO locks (task_id, holder, acquired_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![id, holder, now_str, expires_str],
-        )?;
-
-        conn.execute(
-            "UPDATE tasks SET status = 'in_progress', updated_at = ?1 WHERE id = ?2",
-            params![now_str, id],
-        )?;
-
-        log_event(conn, &id, "acquired", Some(holder))?;
-
-        Ok(Some(id))
-    })();
-
-    match result {
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK");
-            Err(e)
-        }
-        Ok(None) => {
-            conn.execute_batch("COMMIT")?;
-            Ok(None)
-        }
-        Ok(Some(id)) => {
-            conn.execute_batch("COMMIT")?;
-            get_task(conn, &id)
-        }
-    }
 }
 
 /// Reap expired locks and reset stalled `in_progress` tasks back to `open`.
@@ -753,9 +626,8 @@ pub fn stats(conn: &Connection) -> anyhow::Result<TaskStats> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_task, create_task, delete_task, gc_tasks, get_task, import_task, list_tasks,
-        migrate, next_task, release_task, renew_task, resolve_id, search_tasks, slugify,
-        update_task,
+        acquire_task, create_task, delete_task, gc_tasks, get_task, list_tasks, migrate,
+        release_task, renew_task, resolve_id, search_tasks, slugify, update_task,
     };
     use crate::models::{Priority, SortBy, Status};
     use chrono::Utc;
@@ -918,7 +790,7 @@ mod tests {
     #[rstest]
     fn list_empty(conn: Connection) {
         assert!(
-            list_tasks(&conn, None, None, false, None, None, SortBy::Num, None)
+            list_tasks(&conn, None, None, false, SortBy::Num, None)
                 .unwrap()
                 .is_empty()
         );
@@ -929,7 +801,7 @@ mod tests {
         create_task(&conn, "a", "A", None, None, Priority::Medium).unwrap();
         create_task(&conn, "b", "B", None, None, Priority::Medium).unwrap();
         create_task(&conn, "c", "C", None, None, Priority::Medium).unwrap();
-        let tasks = list_tasks(&conn, None, None, false, None, None, SortBy::Num, None).unwrap();
+        let tasks = list_tasks(&conn, None, None, false, SortBy::Num, None).unwrap();
         assert_eq!(tasks.len(), 3);
         assert!(tasks[0].num < tasks[1].num);
         assert!(tasks[1].num < tasks[2].num);
@@ -968,17 +840,7 @@ mod tests {
         )
         .unwrap();
 
-        let tasks = list_tasks(
-            &conn,
-            Some(&filter),
-            None,
-            false,
-            None,
-            None,
-            SortBy::Num,
-            None,
-        )
-        .unwrap();
+        let tasks = list_tasks(&conn, Some(&filter), None, false, SortBy::Num, None).unwrap();
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].status, filter);
     }
@@ -1015,17 +877,8 @@ mod tests {
         )
         .unwrap();
 
-        let children = list_tasks(
-            &conn,
-            None,
-            Some(parent.as_str()),
-            false,
-            None,
-            None,
-            SortBy::Num,
-            None,
-        )
-        .unwrap();
+        let children =
+            list_tasks(&conn, None, Some(parent.as_str()), false, SortBy::Num, None).unwrap();
         assert_eq!(children.len(), 2);
         assert!(children.iter().any(|t| t.id == c1));
         assert!(children.iter().any(|t| t.id == c2));
@@ -1349,8 +1202,7 @@ mod tests {
         )
         .unwrap();
 
-        let results =
-            search_tasks(&conn, "Login", None, None, None, None, SortBy::Num, None).unwrap();
+        let results = search_tasks(&conn, "Login", None, None, SortBy::Num, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Fix Login Bug");
     }
@@ -1376,17 +1228,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = search_tasks(
-            &conn,
-            "unique_keyword",
-            None,
-            None,
-            None,
-            None,
-            SortBy::Num,
-            None,
-        )
-        .unwrap();
+        let results = search_tasks(&conn, "unique_keyword", None, None, SortBy::Num, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].title, "Task A");
     }
@@ -1403,17 +1245,7 @@ mod tests {
         )
         .unwrap();
 
-        let results = search_tasks(
-            &conn,
-            "xyzzy_no_match",
-            None,
-            None,
-            None,
-            None,
-            SortBy::Num,
-            None,
-        )
-        .unwrap();
+        let results = search_tasks(&conn, "xyzzy_no_match", None, None, SortBy::Num, None).unwrap();
         assert!(results.is_empty());
     }
 
@@ -1432,17 +1264,7 @@ mod tests {
         .unwrap();
         create_task(&conn, "task-b", "Task B", None, None, Priority::Medium).unwrap();
 
-        let results = search_tasks(
-            &conn,
-            "approach_xyz",
-            None,
-            None,
-            None,
-            None,
-            SortBy::Num,
-            None,
-        )
-        .unwrap();
+        let results = search_tasks(&conn, "approach_xyz", None, None, SortBy::Num, None).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, id);
     }
@@ -1453,31 +1275,13 @@ mod tests {
         let id2 = create_task(&conn, "task-b", "Alpha Done", None, None, Priority::Medium).unwrap();
         update_task(&conn, &id2, None, None, Some(&Status::Done), None, None).unwrap();
 
-        let open_results = search_tasks(
-            &conn,
-            "Alpha",
-            Some(&Status::Open),
-            None,
-            None,
-            None,
-            SortBy::Num,
-            None,
-        )
-        .unwrap();
+        let open_results =
+            search_tasks(&conn, "Alpha", Some(&Status::Open), None, SortBy::Num, None).unwrap();
         assert_eq!(open_results.len(), 1);
         assert_eq!(open_results[0].id, id1);
 
-        let done_results = search_tasks(
-            &conn,
-            "Alpha",
-            Some(&Status::Done),
-            None,
-            None,
-            None,
-            SortBy::Num,
-            None,
-        )
-        .unwrap();
+        let done_results =
+            search_tasks(&conn, "Alpha", Some(&Status::Done), None, SortBy::Num, None).unwrap();
         assert_eq!(done_results.len(), 1);
         assert_eq!(done_results[0].id, id2);
     }
@@ -1512,86 +1316,12 @@ mod tests {
             "Alpha",
             None,
             Some(parent.as_str()),
-            None,
-            None,
             SortBy::Num,
             None,
         )
         .unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, c1);
-    }
-
-    // ── next_task ─────────────────────────────────────────────────────────────
-
-    #[rstest]
-    fn next_task_returns_none_when_empty(conn: Connection) {
-        assert!(next_task(&conn, "agent1", 3600, None).unwrap().is_none());
-    }
-
-    #[rstest]
-    fn next_task_returns_lowest_num(conn: Connection) {
-        let _id1 = create_task(&conn, "task-a", "Task A", None, None, Priority::Medium).unwrap();
-        let _id2 = create_task(&conn, "task-b", "Task B", None, None, Priority::Medium).unwrap();
-        let task = next_task(&conn, "agent1", 3600, None).unwrap().unwrap();
-        assert_eq!(task.id, _id1);
-    }
-
-    #[rstest]
-    fn next_task_sets_in_progress_and_locks(conn: Connection) {
-        let id = create_task(&conn, "task-a", "Task A", None, None, Priority::Medium).unwrap();
-        let task = next_task(&conn, "agent1", 3600, None).unwrap().unwrap();
-        assert_eq!(task.id, id);
-        assert_eq!(task.status, Status::InProgress);
-        assert_eq!(task.locked_by.as_deref(), Some("agent1"));
-        assert!(task.lock_expires.is_some());
-    }
-
-    #[rstest]
-    fn next_task_skips_in_progress(conn: Connection) {
-        let id1 = create_task(&conn, "task-a", "Task A", None, None, Priority::Medium).unwrap();
-        let id2 = create_task(&conn, "task-b", "Task B", None, None, Priority::Medium).unwrap();
-        acquire_task(&conn, &id1, "other-agent", 3600).unwrap();
-        let task = next_task(&conn, "agent1", 3600, None).unwrap().unwrap();
-        assert_eq!(task.id, id2);
-    }
-
-    #[rstest]
-    fn next_task_respects_parent_filter(conn: Connection) {
-        let parent = create_task(&conn, "parent", "Parent", None, None, Priority::Medium).unwrap();
-        let _unrelated = create_task(
-            &conn,
-            "unrelated",
-            "Unrelated",
-            None,
-            None,
-            Priority::Medium,
-        )
-        .unwrap();
-        let child = create_task(
-            &conn,
-            "child",
-            "Child",
-            None,
-            Some(parent.as_str()),
-            Priority::Medium,
-        )
-        .unwrap();
-        let task = next_task(&conn, "agent1", 3600, Some(parent.as_str()))
-            .unwrap()
-            .unwrap();
-        assert_eq!(task.id, child);
-    }
-
-    #[rstest]
-    fn next_task_parent_filter_no_match_returns_none(conn: Connection) {
-        let parent = create_task(&conn, "parent", "Parent", None, None, Priority::Medium).unwrap();
-        // No children under parent
-        assert!(
-            next_task(&conn, "agent1", 3600, Some(parent.as_str()))
-                .unwrap()
-                .is_none()
-        );
     }
 
     // ── gc_tasks ──────────────────────────────────────────────────────────────
@@ -1647,48 +1377,5 @@ mod tests {
         assert!(gc_tasks(&conn, false).unwrap().is_empty());
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.status, Status::InProgress);
-    }
-
-    // ── import_task ───────────────────────────────────────────────────────────
-
-    #[rstest]
-    fn import_skips_duplicate(conn: Connection) {
-        // Build a fresh Task value not yet in the database.
-        let now = Utc::now();
-        let task = crate::models::Task {
-            id: "0042-import-me".to_string(),
-            num: 42,
-            title: "Import Me".to_string(),
-            description: None,
-            summary: None,
-            status: Status::Open,
-            created_at: now,
-            updated_at: now,
-            locked_by: None,
-            lock_expires: None,
-            parent_id: None,
-            priority: crate::models::Priority::Medium,
-        };
-
-        // First call: row is new — should be inserted.
-        let first = import_task(&conn, &task).unwrap();
-        assert!(first, "first import_task call should return true (new row)");
-
-        // Second call: same id — should be skipped.
-        let second = import_task(&conn, &task).unwrap();
-        assert!(
-            !second,
-            "second import_task call should return false (duplicate)"
-        );
-
-        // Row count must still be exactly 1.
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM tasks WHERE id = ?1",
-                ["0042-import-me"],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1, "row count should remain 1 after duplicate import");
     }
 }

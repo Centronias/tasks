@@ -89,10 +89,6 @@ enum Command {
         #[arg(long)]
         parent: Option<String>,
 
-        /// Optional closing summary (decisions, approach, caveats).
-        #[arg(long)]
-        summary: Option<String>,
-
         /// Priority level for this task.
         /// Accepted values: `low`, `medium` (default), `high`, `critical`.
         #[arg(long, default_value = "medium")]
@@ -135,14 +131,6 @@ enum Command {
         /// Incompatible with --json.
         #[arg(long)]
         tree: bool,
-
-        /// Maximum number of tasks to return.
-        #[arg(long)]
-        limit: Option<i64>,
-
-        /// Number of tasks to skip before returning results.
-        #[arg(long)]
-        offset: Option<i64>,
 
         /// Sort order for results.
         /// Accepted values: `num` (default), `updated`, `created`, `status`.
@@ -326,14 +314,6 @@ enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Maximum number of tasks to return.
-        #[arg(long)]
-        limit: Option<i64>,
-
-        /// Number of tasks to skip before returning results.
-        #[arg(long)]
-        offset: Option<i64>,
-
         /// Sort order for results.
         /// Accepted values: `num` (default), `updated`, `created`, `status`.
         #[arg(long, default_value = "num")]
@@ -374,58 +354,9 @@ enum Command {
         holder: Option<String>,
     },
 
-    /// Atomically grab the next open task and acquire it.
-    ///
-    /// Finds the first open task (lowest num), acquires it, and prints it as JSON.
-    /// Exits non-zero with a clear message if no open tasks are available.
-    Next {
-        /// Only consider tasks with this parent ID.
-        #[arg(long)]
-        parent: Option<String>,
-
-        /// Lock TTL in seconds (default: 3600).
-        #[arg(long, default_value = "3600")]
-        ttl: i64,
-
-        /// Name of the holder acquiring the lock.
-        #[arg(long)]
-        holder: Option<String>,
-    },
-
     /// Reap expired locks and reset stalled in-progress tasks to open.
     Gc {
         /// Preview what would be recovered without making changes.
-        #[arg(long)]
-        dry_run: bool,
-    },
-
-    /// Export tasks as a JSON array to stdout or a file.
-    ///
-    /// By default exports only `open` and `in_progress` tasks.
-    /// Pass `--all` to include every status.
-    /// Pass `--output <file>` to write to a file instead of stdout.
-    Export {
-        /// Export all tasks regardless of status.
-        #[arg(long)]
-        all: bool,
-
-        /// Write the JSON output to this file instead of stdout.
-        #[arg(long)]
-        output: Option<String>,
-    },
-
-    /// Import tasks from a JSON file (as produced by `tasks export`).
-    ///
-    /// Reads a JSON array of task objects and creates each as a new task,
-    /// assigning fresh IDs. Original IDs are not preserved to avoid collisions.
-    ///
-    /// Pass `--dry-run` to preview what would be created without writing.
-    Import {
-        /// Path to the JSON file to import.
-        #[arg(long)]
-        file: String,
-
-        /// Preview what would be imported without writing anything.
         #[arg(long)]
         dry_run: bool,
     },
@@ -455,6 +386,31 @@ fn resolve_holder(flag: Option<String>) -> anyhow::Result<String> {
                 "a holder name is required: pass --holder or set the TASK_HOLDER environment variable"
             )
         })
+}
+
+fn print_task_table(tasks: &[models::Task]) {
+    use comfy_table::presets::UTF8_FULL_CONDENSED;
+    use comfy_table::{Cell, ContentArrangement, Table};
+    let mut table = Table::new();
+    table
+        .load_preset(UTF8_FULL_CONDENSED)
+        .set_content_arrangement(ContentArrangement::Dynamic)
+        .set_header(vec!["ID", "STATUS", "PRIORITY", "TITLE", "LOCKED"]);
+    for task in tasks {
+        let lock_marker = if task.locked_by.is_some() {
+            "\u{1f512}"
+        } else {
+            ""
+        };
+        table.add_row(vec![
+            Cell::new(&task.id),
+            Cell::new(&task.status),
+            Cell::new(task.priority),
+            Cell::new(&task.title),
+            Cell::new(lock_marker),
+        ]);
+    }
+    println!("{table}");
 }
 
 fn print_task_human(task: &models::Task) {
@@ -558,7 +514,6 @@ fn main() -> anyhow::Result<()> {
             description,
             id,
             parent,
-            summary,
             priority,
         } => {
             let title = title.or(title_pos).ok_or_else(|| {
@@ -575,9 +530,6 @@ fn main() -> anyhow::Result<()> {
                 parent.as_deref(),
                 priority,
             )?;
-            if let Some(s) = summary {
-                db::update_task(&conn, &full_id, None, None, None, Some(s.as_str()), None)?;
-            }
             println!("{full_id}");
         }
 
@@ -587,8 +539,6 @@ fn main() -> anyhow::Result<()> {
             all,
             json,
             tree,
-            limit,
-            offset,
             sort,
             count,
             priority,
@@ -598,16 +548,7 @@ fn main() -> anyhow::Result<()> {
             }
             if tree {
                 // Fetch all tasks (ignoring parent filter for tree — we show the whole tree)
-                let tasks = db::list_tasks(
-                    &conn,
-                    status.as_ref(),
-                    None,
-                    true,
-                    None,
-                    None,
-                    SortBy::Num,
-                    None,
-                )?;
+                let tasks = db::list_tasks(&conn, status.as_ref(), None, true, SortBy::Num, None)?;
                 print_tree(&tasks, parent.as_deref());
             } else {
                 let tasks = db::list_tasks(
@@ -615,8 +556,6 @@ fn main() -> anyhow::Result<()> {
                     status.as_ref(),
                     parent.as_deref(),
                     all,
-                    limit,
-                    offset,
                     sort,
                     priority.as_ref(),
                 )?;
@@ -627,27 +566,7 @@ fn main() -> anyhow::Result<()> {
                 if json {
                     println!("{}", serde_json::to_string_pretty(&tasks)?);
                 } else {
-                    use comfy_table::presets::UTF8_FULL_CONDENSED;
-                    use comfy_table::{Cell, ContentArrangement, Table};
-                    let mut table = Table::new();
-                    table
-                        .load_preset(UTF8_FULL_CONDENSED)
-                        .set_content_arrangement(ContentArrangement::Dynamic)
-                        .set_header(vec!["ID", "STATUS", "TITLE", "LOCKED"]);
-                    for task in &tasks {
-                        let lock_marker = if task.locked_by.is_some() {
-                            "\u{1f512}"
-                        } else {
-                            ""
-                        };
-                        table.add_row(vec![
-                            Cell::new(&task.id),
-                            Cell::new(&task.status),
-                            Cell::new(&task.title),
-                            Cell::new(lock_marker),
-                        ]);
-                    }
-                    println!("{table}");
+                    print_task_table(&tasks);
                 }
             }
         }
@@ -762,8 +681,6 @@ fn main() -> anyhow::Result<()> {
             status,
             parent,
             json,
-            limit,
-            offset,
             sort,
             count,
             priority,
@@ -773,8 +690,6 @@ fn main() -> anyhow::Result<()> {
                 &query,
                 status.as_ref(),
                 parent.as_deref(),
-                limit,
-                offset,
                 sort,
                 priority.as_ref(),
             )?;
@@ -785,27 +700,7 @@ fn main() -> anyhow::Result<()> {
             if json {
                 println!("{}", serde_json::to_string_pretty(&tasks)?);
             } else {
-                use comfy_table::presets::UTF8_FULL_CONDENSED;
-                use comfy_table::{Cell, ContentArrangement, Table};
-                let mut table = Table::new();
-                table
-                    .load_preset(UTF8_FULL_CONDENSED)
-                    .set_content_arrangement(ContentArrangement::Dynamic)
-                    .set_header(vec!["ID", "STATUS", "TITLE", "LOCKED"]);
-                for task in &tasks {
-                    let lock_marker = if task.locked_by.is_some() {
-                        "\u{1f512}"
-                    } else {
-                        ""
-                    };
-                    table.add_row(vec![
-                        Cell::new(&task.id),
-                        Cell::new(&task.status),
-                        Cell::new(&task.title),
-                        Cell::new(lock_marker),
-                    ]);
-                }
-                println!("{table}");
+                print_task_table(&tasks);
             }
         }
 
@@ -833,23 +728,6 @@ fn main() -> anyhow::Result<()> {
             println!("closed {id}");
         }
 
-        Command::Next {
-            parent,
-            ttl,
-            holder,
-        } => {
-            let holder = resolve_holder(holder)?;
-            match db::next_task(&conn, &holder, ttl, parent.as_deref())? {
-                None => {
-                    eprintln!("no open tasks");
-                    std::process::exit(1);
-                }
-                Some(task) => {
-                    println!("{}", serde_json::to_string_pretty(&task)?);
-                }
-            }
-        }
-
         Command::Gc { dry_run } => {
             let ids = db::gc_tasks(&conn, dry_run)?;
             if ids.is_empty() {
@@ -863,49 +741,6 @@ fn main() -> anyhow::Result<()> {
                     );
                 } else {
                     println!("recovered {} stalled tasks: {id_list}", ids.len());
-                }
-            }
-        }
-
-        Command::Export { all, output } => {
-            let tasks = db::list_tasks(&conn, None, None, all, None, None, SortBy::Num, None)?;
-            let json = serde_json::to_string_pretty(&tasks)?;
-            match output {
-                Some(path) => std::fs::write(&path, &json)
-                    .map_err(|e| anyhow::anyhow!("failed to write {path}: {e}"))?,
-                None => println!("{json}"),
-            }
-        }
-
-        Command::Import { file, dry_run } => {
-            let content = std::fs::read_to_string(&file)
-                .map_err(|e| anyhow::anyhow!("failed to read {file}: {e}"))?;
-            let tasks: Vec<models::Task> = serde_json::from_str(&content)
-                .map_err(|e| anyhow::anyhow!("invalid JSON in {file}: {e}"))?;
-            let count = tasks.len();
-            if dry_run {
-                for task in &tasks {
-                    println!(
-                        "would import: {} ({})",
-                        task.title,
-                        task.description.as_deref().unwrap_or("no description")
-                    );
-                }
-                println!("would import {count} tasks");
-            } else {
-                let mut imported = 0usize;
-                let mut skipped = 0usize;
-                for task in &tasks {
-                    if db::import_task(&conn, task)? {
-                        imported += 1;
-                    } else {
-                        skipped += 1;
-                    }
-                }
-                if skipped > 0 {
-                    println!("imported {imported}, skipped {skipped} (already exist)");
-                } else {
-                    println!("imported {imported}");
                 }
             }
         }

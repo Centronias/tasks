@@ -41,7 +41,7 @@ tasks create --title "Migrate orders table"   --description "..."
 # Launch three workers, each given one task ID
 ```
 
-If two workers race for the same task, the loser gets an error and should pick a different open task.
+If two workers race for the same task, the loser gets an error and should notify the orchestrator so it can assign a different task explicitly.
 
 ### Decomposing large tasks
 
@@ -77,12 +77,6 @@ Use `--count` for a quick backlog-size check — it prints only the integer coun
 tasks list --status open --count
 ```
 
-For large backlogs, `--limit` and `--offset` are available on both `tasks list` and `tasks search` to page through results. For example:
-
-```
-tasks list --status open --limit 20 --offset 0
-```
-
 The JSON output includes `locked_by` and `lock_expires` per task. Use `tasks show <id>` for full detail on a specific task.
 
 ### Recovering a stalled worker
@@ -112,6 +106,8 @@ tasks acquire 0007-add-rate-limiting-to-api-login --holder replacement-worker
 
 **Marking a parent done with open children.** Always check `tasks list --parent <id> --status open` and `--status in_progress` before closing a parent.
 
+**Committing, pushing, or publishing changes.** Orchestrators must never run `git commit`, `git push`, release commands, or any operation that publishes work externally. Only humans decide when changes are committed and pushed.
+
 ---
 
 ## Part 2: Worker
@@ -134,16 +130,16 @@ All lock operations (`acquire`, `release`, `renew`) use this identity. If two ag
 
 ### Picking up a task
 
-For workers picking freely from the queue, `tasks next` is the preferred approach — it atomically finds and acquires the first open task in one step, eliminating any race window:
+Workers receive a specific task ID from the orchestrator — they do not browse the backlog or choose what to work on. Acquire exactly the ID you were given:
 
 ```
-tasks next
+tasks acquire 0003-fix-auth-bug
 ```
 
-If you need to pick a specific task (e.g. one assigned by an orchestrator), use the two-step approach:
+If you want to confirm the task details before acquiring, inspect it directly:
 
 ```
-tasks list --status open
+tasks show 0003-fix-auth-bug
 tasks acquire 0003-fix-auth-bug
 ```
 
@@ -215,6 +211,8 @@ The distinction: if the parent task cannot be marked `done` without this work, i
 **Forgetting to renew long-running work.** Default TTL is 1 hour. Set a longer TTL at acquire time or renew periodically for slow work.
 
 **Tagging follow-up tasks as children.** Mixing temporal and structural relationships makes `tasks list --parent` unreliable as a completion gate.
+
+**Committing, pushing, or publishing changes.** Workers must never run `git commit`, `git push`, release commands, or any operation that publishes work externally. Make the code changes, close the task, and leave the commit/push decision to the human.
 
 ---
 
