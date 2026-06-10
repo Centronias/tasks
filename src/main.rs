@@ -320,6 +320,31 @@ enum Command {
         holder: Option<String>,
     },
 
+    /// Atomically grab the next open task and acquire it.
+    ///
+    /// Finds the first open task (lowest num), acquires it, and prints it as JSON.
+    /// Exits non-zero with a clear message if no open tasks are available.
+    Next {
+        /// Only consider tasks with this parent ID.
+        #[arg(long)]
+        parent: Option<String>,
+
+        /// Lock TTL in seconds (default: 3600).
+        #[arg(long, default_value = "3600")]
+        ttl: i64,
+
+        /// Name of the holder acquiring the lock.
+        #[arg(long)]
+        holder: Option<String>,
+    },
+
+    /// Reap expired locks and reset stalled in-progress tasks to open.
+    Gc {
+        /// Preview what would be recovered without making changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Generate a shell completion script and print it to stdout.
     ///
     /// Source the output in your shell profile to enable tab-completion for all
@@ -667,6 +692,40 @@ fn main() -> anyhow::Result<()> {
                 anyhow::bail!("task not found: {id}");
             }
             println!("closed {id}");
+        }
+
+        Command::Next {
+            parent,
+            ttl,
+            holder,
+        } => {
+            let holder = resolve_holder(holder)?;
+            match db::next_task(&conn, &holder, ttl, parent.as_deref())? {
+                None => {
+                    eprintln!("no open tasks");
+                    std::process::exit(1);
+                }
+                Some(task) => {
+                    println!("{}", serde_json::to_string_pretty(&task)?);
+                }
+            }
+        }
+
+        Command::Gc { dry_run } => {
+            let ids = db::gc_tasks(&conn, dry_run)?;
+            if ids.is_empty() {
+                println!("nothing to recover");
+            } else {
+                let id_list = ids.join(", ");
+                if dry_run {
+                    println!(
+                        "dry-run: would recover {} stalled tasks: {id_list}",
+                        ids.len()
+                    );
+                } else {
+                    println!("recovered {} stalled tasks: {id_list}", ids.len());
+                }
+            }
         }
 
         // Handled before db::open_db() above; unreachable here.

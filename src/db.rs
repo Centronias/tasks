@@ -407,6 +407,105 @@ pub fn acquire_task(conn: &Connection, id: &str, holder: &str, ttl: u64) -> anyh
     Ok(())
 }
 
+/// Atomically find the first open task, acquire it, and return it.
+///
+/// Wraps the SELECT → INSERT lock → UPDATE status sequence in a single
+/// BEGIN IMMEDIATE / COMMIT block so no two callers can grab the same task.
+pub fn next_task(
+    conn: &Connection,
+    holder: &str,
+    ttl_secs: i64,
+    parent_filter: Option<&str>,
+) -> rusqlite::Result<Option<Task>> {
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+    let expires_str = (now + chrono::Duration::seconds(ttl_secs)).to_rfc3339();
+
+    conn.execute_batch("BEGIN IMMEDIATE")?;
+
+    let result = (|| -> rusqlite::Result<Option<String>> {
+        let task_id: Option<String> = conn
+            .query_row(
+                "SELECT id FROM tasks
+                 WHERE status = 'open'
+                   AND (?1 IS NULL OR parent_id = ?1)
+                 ORDER BY num ASC
+                 LIMIT 1",
+                params![parent_filter],
+                |r| r.get(0),
+            )
+            .optional()?;
+
+        let Some(id) = task_id else { return Ok(None) };
+
+        conn.execute(
+            "INSERT OR REPLACE INTO locks (task_id, holder, acquired_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![id, holder, now_str, expires_str],
+        )?;
+
+        conn.execute(
+            "UPDATE tasks SET status = 'in_progress', updated_at = ?1 WHERE id = ?2",
+            params![now_str, id],
+        )?;
+
+        log_event(conn, &id, "acquired", Some(holder))?;
+
+        Ok(Some(id))
+    })();
+
+    match result {
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK");
+            Err(e)
+        }
+        Ok(None) => {
+            conn.execute_batch("COMMIT")?;
+            Ok(None)
+        }
+        Ok(Some(id)) => {
+            conn.execute_batch("COMMIT")?;
+            get_task(conn, &id)
+        }
+    }
+}
+
+/// Reap expired locks and reset stalled `in_progress` tasks back to `open`.
+///
+/// Returns the IDs of tasks that were (or would be, when `dry_run` is true)
+/// recovered.
+pub fn gc_tasks(conn: &Connection, dry_run: bool) -> rusqlite::Result<Vec<String>> {
+    let now = Utc::now().to_rfc3339();
+
+    // Find all in_progress tasks whose lock has expired.
+    let mut stmt = conn.prepare(
+        "SELECT t.id
+         FROM tasks t
+         INNER JOIN locks l ON l.task_id = t.id
+         WHERE t.status = 'in_progress'
+           AND l.expires_at < ?1
+         ORDER BY t.num ASC",
+    )?;
+    let ids: Vec<String> = stmt
+        .query_map(params![now], |r| r.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+
+    if dry_run || ids.is_empty() {
+        return Ok(ids);
+    }
+
+    for id in &ids {
+        conn.execute("DELETE FROM locks WHERE task_id = ?1", [id.as_str()])?;
+        conn.execute(
+            "UPDATE tasks SET status = 'open', updated_at = ?1 WHERE id = ?2",
+            params![now, id],
+        )?;
+        log_event(conn, id, "gc", None)?;
+    }
+
+    Ok(ids)
+}
+
 pub fn release_task(
     conn: &Connection,
     id: &str,
@@ -546,8 +645,8 @@ pub fn stats(conn: &Connection) -> anyhow::Result<TaskStats> {
 #[cfg(test)]
 mod tests {
     use super::{
-        acquire_task, create_task, delete_task, get_task, list_tasks, migrate, release_task,
-        renew_task, resolve_id, search_tasks, slugify, update_task,
+        acquire_task, create_task, delete_task, gc_tasks, get_task, list_tasks, migrate, next_task,
+        release_task, renew_task, resolve_id, search_tasks, slugify, update_task,
     };
     use crate::models::Status;
     use chrono::Utc;
@@ -1049,5 +1148,116 @@ mod tests {
         let results = search_tasks(&conn, "Alpha", None, Some(parent.as_str())).unwrap();
         assert_eq!(results.len(), 1);
         assert_eq!(results[0].id, c1);
+    }
+
+    // ── next_task ─────────────────────────────────────────────────────────────
+
+    #[rstest]
+    fn next_task_returns_none_when_empty(conn: Connection) {
+        assert!(next_task(&conn, "agent1", 3600, None).unwrap().is_none());
+    }
+
+    #[rstest]
+    fn next_task_returns_lowest_num(conn: Connection) {
+        let _id1 = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        let _id2 = create_task(&conn, "task-b", "Task B", None, None).unwrap();
+        let task = next_task(&conn, "agent1", 3600, None).unwrap().unwrap();
+        assert_eq!(task.id, _id1);
+    }
+
+    #[rstest]
+    fn next_task_sets_in_progress_and_locks(conn: Connection) {
+        let id = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        let task = next_task(&conn, "agent1", 3600, None).unwrap().unwrap();
+        assert_eq!(task.id, id);
+        assert_eq!(task.status, Status::InProgress);
+        assert_eq!(task.locked_by.as_deref(), Some("agent1"));
+        assert!(task.lock_expires.is_some());
+    }
+
+    #[rstest]
+    fn next_task_skips_in_progress(conn: Connection) {
+        let id1 = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        let id2 = create_task(&conn, "task-b", "Task B", None, None).unwrap();
+        acquire_task(&conn, &id1, "other-agent", 3600).unwrap();
+        let task = next_task(&conn, "agent1", 3600, None).unwrap().unwrap();
+        assert_eq!(task.id, id2);
+    }
+
+    #[rstest]
+    fn next_task_respects_parent_filter(conn: Connection) {
+        let parent = create_task(&conn, "parent", "Parent", None, None).unwrap();
+        let _unrelated = create_task(&conn, "unrelated", "Unrelated", None, None).unwrap();
+        let child = create_task(&conn, "child", "Child", None, Some(parent.as_str())).unwrap();
+        let task = next_task(&conn, "agent1", 3600, Some(parent.as_str()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, child);
+    }
+
+    #[rstest]
+    fn next_task_parent_filter_no_match_returns_none(conn: Connection) {
+        let parent = create_task(&conn, "parent", "Parent", None, None).unwrap();
+        // No children under parent
+        assert!(
+            next_task(&conn, "agent1", 3600, Some(parent.as_str()))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    // ── gc_tasks ──────────────────────────────────────────────────────────────
+
+    #[rstest]
+    fn gc_tasks_returns_empty_when_nothing_to_reap(conn: Connection) {
+        create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        assert!(gc_tasks(&conn, false).unwrap().is_empty());
+    }
+
+    #[rstest]
+    fn gc_tasks_recovers_expired_lock(conn: Connection) {
+        let id = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        // Manually put the task into in_progress with an expired lock.
+        insert_expired_lock(&conn, &id, "old-agent");
+        conn.execute(
+            "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+            [id.as_str()],
+        )
+        .unwrap();
+
+        let recovered = gc_tasks(&conn, false).unwrap();
+        assert_eq!(recovered, vec![id.clone()]);
+
+        let task = get_task(&conn, &id).unwrap().unwrap();
+        assert_eq!(task.status, Status::Open);
+        assert!(task.locked_by.is_none());
+    }
+
+    #[rstest]
+    fn gc_tasks_dry_run_does_not_modify(conn: Connection) {
+        let id = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        insert_expired_lock(&conn, &id, "old-agent");
+        conn.execute(
+            "UPDATE tasks SET status = 'in_progress' WHERE id = ?1",
+            [id.as_str()],
+        )
+        .unwrap();
+
+        let would_recover = gc_tasks(&conn, true).unwrap();
+        assert_eq!(would_recover, vec![id.clone()]);
+
+        // Status should still be in_progress — dry_run made no changes.
+        let task = get_task(&conn, &id).unwrap().unwrap();
+        assert_eq!(task.status, Status::InProgress);
+    }
+
+    #[rstest]
+    fn gc_tasks_ignores_active_locks(conn: Connection) {
+        let id = create_task(&conn, "task-a", "Task A", None, None).unwrap();
+        acquire_task(&conn, &id, "active-agent", 3600).unwrap();
+
+        assert!(gc_tasks(&conn, false).unwrap().is_empty());
+        let task = get_task(&conn, &id).unwrap().unwrap();
+        assert_eq!(task.status, Status::InProgress);
     }
 }
