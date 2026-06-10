@@ -154,19 +154,19 @@ tasks renew 0003-fix-auth-bug --ttl 3600
 
 ### Finishing a task
 
-Release the lock and mark done — both steps are required, in either order:
+Before releasing, record what you did with `--summary`. This is your closing record — decisions made, approach taken, caveats, anything useful for someone reading the task later. Keep it to 1–3 sentences. It is separate from `--description`, which is the upfront brief written by whoever created the task.
 
 ```
+tasks update 0003-fix-auth-bug --summary "Patched JWT expiry check in auth.rs; added regression test in auth_test.rs"
 tasks release 0003-fix-auth-bug
 tasks update  0003-fix-auth-bug --status done
 ```
 
-Optionally leave a note first:
+You can also set status and summary in one call:
 
 ```
-tasks update 0003-fix-auth-bug --description "Fixed by patching JWT expiry check in auth.rs"
+tasks update 0003-fix-auth-bug --summary "Chose approach X over Y due to Z" --status done
 tasks release 0003-fix-auth-bug
-tasks update  0003-fix-auth-bug --status done
 ```
 
 ### Abandoning a task (returning it to the queue)

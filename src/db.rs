@@ -38,6 +38,15 @@ pub fn migrate(conn: &Connection) -> rusqlite::Result<()> {
     if !col_exists {
         conn.execute_batch("ALTER TABLE tasks ADD COLUMN parent_id TEXT REFERENCES tasks(id)")?;
     }
+    // Add summary to databases created before this column existed.
+    let summary_exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM pragma_table_info('tasks') WHERE name = 'summary'",
+        [],
+        |r| r.get(0),
+    )?;
+    if !summary_exists {
+        conn.execute_batch("ALTER TABLE tasks ADD COLUMN summary TEXT")?;
+    }
     Ok(())
 }
 
@@ -82,8 +91,8 @@ pub fn create_task(
     let now = Utc::now().to_rfc3339();
     // Single statement: SELECT MAX(num)+1 and INSERT are atomic, eliminating TOCTOU.
     conn.execute(
-        "INSERT INTO tasks (id, num, title, description, status, created_at, updated_at, parent_id)
-         SELECT printf('%04d-%s', n, ?1), n, ?2, ?3, 'open', ?4, ?4, ?5
+        "INSERT INTO tasks (id, num, title, description, status, created_at, updated_at, parent_id, summary)
+         SELECT printf('%04d-%s', n, ?1), n, ?2, ?3, 'open', ?4, ?4, ?5, NULL
          FROM (SELECT COALESCE(MAX(num), 0) + 1 AS n FROM tasks)",
         params![slug, title, description, now, parent_id],
     )?;
@@ -127,6 +136,7 @@ fn row_to_task(row: &rusqlite::Row) -> rusqlite::Result<Task> {
         num: row.get(1)?,
         title: row.get(2)?,
         description: row.get(3)?,
+        summary: row.get(10)?,
         status,
         created_at,
         updated_at,
@@ -150,7 +160,7 @@ pub fn list_tasks(
                       t.created_at, t.updated_at,
                       CASE WHEN l.expires_at > ?1 THEN l.holder END,
                       CASE WHEN l.expires_at > ?1 THEN l.expires_at END,
-                      t.parent_id
+                      t.parent_id, t.summary
                FROM tasks t
                LEFT JOIN locks l ON l.task_id = t.id
                WHERE (
@@ -176,7 +186,7 @@ pub fn get_task(conn: &Connection, id: &str) -> rusqlite::Result<Option<Task>> {
                       t.created_at, t.updated_at,
                       CASE WHEN l.expires_at > ?1 THEN l.holder END,
                       CASE WHEN l.expires_at > ?1 THEN l.expires_at END,
-                      t.parent_id
+                      t.parent_id, t.summary
                FROM tasks t
                LEFT JOIN locks l ON l.task_id = t.id
                WHERE t.id = ?2";
@@ -190,6 +200,7 @@ pub fn update_task(
     title: Option<&str>,
     description: Option<&str>,
     status: Option<&Status>,
+    summary: Option<&str>,
 ) -> rusqlite::Result<bool> {
     let now = Utc::now().to_rfc3339();
     let rows = conn.execute(
@@ -197,9 +208,17 @@ pub fn update_task(
             title       = COALESCE(?1, title),
             description = COALESCE(?2, description),
             status      = COALESCE(?3, status),
-            updated_at  = ?4
-         WHERE id = ?5",
-        params![title, description, status.map(ToString::to_string), now, id],
+            summary     = COALESCE(?4, summary),
+            updated_at  = ?5
+         WHERE id = ?6",
+        params![
+            title,
+            description,
+            status.map(ToString::to_string),
+            summary,
+            now,
+            id
+        ],
     )?;
     Ok(rows > 0)
 }
@@ -609,9 +628,9 @@ mod tests {
         let id3 = create_task(&conn, "task-c", "Task C", None, None).unwrap();
         let id4 = create_task(&conn, "task-d", "Task D", None, None).unwrap();
         // id1 starts as Open; set the rest explicitly
-        update_task(&conn, &id2, None, None, Some(&Status::InProgress)).unwrap();
-        update_task(&conn, &id3, None, None, Some(&Status::Done)).unwrap();
-        update_task(&conn, &id4, None, None, Some(&Status::Cancelled)).unwrap();
+        update_task(&conn, &id2, None, None, Some(&Status::InProgress), None).unwrap();
+        update_task(&conn, &id3, None, None, Some(&Status::Done), None).unwrap();
+        update_task(&conn, &id4, None, None, Some(&Status::Cancelled), None).unwrap();
 
         let tasks = list_tasks(&conn, Some(&filter), None, false).unwrap();
         assert_eq!(tasks.len(), 1);
@@ -636,13 +655,13 @@ mod tests {
 
     #[rstest]
     fn update_missing_returns_false(conn: Connection) {
-        assert!(!update_task(&conn, "9999-no-such", Some("New"), None, None).unwrap());
+        assert!(!update_task(&conn, "9999-no-such", Some("New"), None, None, None).unwrap());
     }
 
     #[rstest]
     fn update_title_only(conn: Connection) {
         let id = create_task(&conn, "my-task", "Old Title", Some("desc"), None).unwrap();
-        update_task(&conn, &id, Some("New Title"), None, None).unwrap();
+        update_task(&conn, &id, Some("New Title"), None, None, None).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.title, "New Title");
         assert_eq!(task.description.as_deref(), Some("desc"));
@@ -652,10 +671,28 @@ mod tests {
     #[rstest]
     fn update_status_only(conn: Connection) {
         let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
-        update_task(&conn, &id, None, None, Some(&Status::Done)).unwrap();
+        update_task(&conn, &id, None, None, Some(&Status::Done), None).unwrap();
         let task = get_task(&conn, &id).unwrap().unwrap();
         assert_eq!(task.status, Status::Done);
         assert_eq!(task.title, "My Task");
+    }
+
+    #[rstest]
+    fn update_summary_only(conn: Connection) {
+        let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
+        update_task(
+            &conn,
+            &id,
+            None,
+            None,
+            None,
+            Some("Completed via approach X"),
+        )
+        .unwrap();
+        let task = get_task(&conn, &id).unwrap().unwrap();
+        assert_eq!(task.summary.as_deref(), Some("Completed via approach X"));
+        assert_eq!(task.title, "My Task");
+        assert_eq!(task.status, Status::Open);
     }
 
     // ── delete_task ───────────────────────────────────────────────────────────
@@ -683,7 +720,7 @@ mod tests {
     #[rstest]
     fn delete_in_progress_without_force_errors(conn: Connection) {
         let id = create_task(&conn, "my-task", "My Task", None, None).unwrap();
-        update_task(&conn, &id, None, None, Some(&Status::InProgress)).unwrap();
+        update_task(&conn, &id, None, None, Some(&Status::InProgress), None).unwrap();
         let err = delete_task(&conn, &id, false).unwrap_err();
         assert!(err.to_string().contains("--force"));
     }

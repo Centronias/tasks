@@ -84,6 +84,10 @@ enum Command {
         /// can later be queried with `task list --parent <id>`.
         #[arg(long)]
         parent: Option<String>,
+
+        /// Optional closing summary (decisions, approach, caveats).
+        #[arg(long)]
+        summary: Option<String>,
     },
 
     /// List tasks, optionally filtered by status and/or parent.
@@ -134,8 +138,8 @@ enum Command {
 
     /// Update one or more fields of an existing task.
     ///
-    /// At least one of `--title`, `--description`, or `--status` must be
-    /// supplied. Omitted fields are left unchanged.
+    /// At least one of `--title`, `--description`, `--status`, or `--summary`
+    /// must be supplied. Omitted fields are left unchanged.
     Update {
         /// Full task ID, e.g. `0001-fix-login-bug`.
         id: String,
@@ -152,6 +156,11 @@ enum Command {
         /// Accepted values: `open`, `in_progress`, `done`, `cancelled`.
         #[arg(long, value_parser = parse_status)]
         status: Option<Status>,
+
+        /// Worker's closing summary: decisions made, approach taken, caveats.
+        /// Set this before releasing the lock to leave a record of outcomes.
+        #[arg(long)]
+        summary: Option<String>,
     },
 
     /// Delete a task permanently.
@@ -268,6 +277,9 @@ fn print_task_human(task: &models::Task) {
     if let Some(d) = &task.description {
         println!("description: {d}");
     }
+    if let Some(s) = &task.summary {
+        println!("summary:     {s}");
+    }
     println!("status:      {}", task.status);
     println!(
         "created_at:  {}",
@@ -302,6 +314,7 @@ fn main() -> anyhow::Result<()> {
             description,
             id,
             parent,
+            summary,
         } => {
             let title = title.or(title_pos).ok_or_else(|| {
                 anyhow::anyhow!(
@@ -316,6 +329,9 @@ fn main() -> anyhow::Result<()> {
                 description.as_deref(),
                 parent.as_deref(),
             )?;
+            if let Some(s) = summary {
+                db::update_task(&conn, &full_id, None, None, None, Some(s.as_str()))?;
+            }
             println!("{full_id}");
         }
 
@@ -372,9 +388,12 @@ fn main() -> anyhow::Result<()> {
             title,
             description,
             status,
+            summary,
         } => {
-            if title.is_none() && description.is_none() && status.is_none() {
-                anyhow::bail!("at least one of --title, --description, --status is required");
+            if title.is_none() && description.is_none() && status.is_none() && summary.is_none() {
+                anyhow::bail!(
+                    "at least one of --title, --description, --status, --summary is required"
+                );
             }
             let id = db::resolve_id(&conn, &id)?;
             let found = db::update_task(
@@ -383,6 +402,7 @@ fn main() -> anyhow::Result<()> {
                 title.as_deref(),
                 description.as_deref(),
                 status.as_ref(),
+                summary.as_deref(),
             )?;
             if !found {
                 anyhow::bail!("task not found: {id}");
